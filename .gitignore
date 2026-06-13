@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+*.so
+*.air
+*.metallib
+.venv/
+.DS_Store
