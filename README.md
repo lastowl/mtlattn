@@ -20,13 +20,18 @@ kernel fixes:
 1. **Wasted compute + memory** on padding, and an `O(B·H·Lmax²)` score
    tensor that blows up unified memory (a real 49K-token workload needed a
    54 GiB allocation).
-2. **A silent-correctness bug in PyTorch's MPS SDPA.** For a large score
-   matrix (empirically `heads·L·L` ≳ 7e9 elements — e.g. ≥ ~24K tokens at
-   12 heads), MPS SDPA returns physically impossible values with *no error*
-   — both masked and unmasked. Smaller is correct; even larger OOMs. Any
-   large attention on MPS is exposed. This kernel streams in constant
-   memory and matches a CPU fp32 reference at those sizes. (Minimal repro
-   with the measured threshold sweep in
+2. **A silent-correctness bug in PyTorch's MPS SDPA.** When the score
+   matrix `B·H·Nq·Nkv` exceeds ~2³² elements, MPS SDPA returns physically
+   impossible values with *no error* (the corruption hits later query rows
+   first, so naive spot-checks of the first rows miss it). This is a known
+   upstream bug — reported as
+   [pytorch/pytorch#179352](https://github.com/pytorch/pytorch/issues/179352)
+   and fixed by the in-progress PR
+   [#179592](https://github.com/pytorch/pytorch/pull/179592); it reproduces
+   on torch ≤ 2.12 until that lands. The root cause is a 32-bit index inside
+   Apple's MPSGraph (reachable via `sdpa_general_mps`). This kernel streams
+   in constant memory and matches a CPU fp32 reference at those sizes, so
+   it's correct today regardless. (Repro:
    [`tests/test_mps_sdpa_bug.py`](tests/test_mps_sdpa_bug.py).)
 
 ## Install

@@ -1,11 +1,19 @@
 """
-Minimal reproduction: PyTorch's MPS scaled_dot_product_attention silently
-returns wrong results for large attention score matrices.
+Reproduction of a known upstream bug: PyTorch's MPS
+scaled_dot_product_attention silently returns wrong results when the score
+matrix B*H*Nq*Nkv exceeds ~2**32 elements.
+
+Reported as pytorch/pytorch#179352 (closed) and fixed by the in-progress PR
+pytorch/pytorch#179592; reproduces on torch <= 2.12 until that lands. Root
+cause is a 32-bit index inside Apple's MPSGraph, reachable via
+sdpa_general_mps. Kept here as a regression check and as the rationale for
+routing large attention through mtlattn instead.
 
 No exception is raised — the output is just physically impossible (values far
 larger in magnitude than any input could produce, when an attention output is
 a convex combination of V and must satisfy |out| <= max|V|), so it corrupts
-downstream computation invisibly.
+downstream computation invisibly. NOTE the corruption hits later query rows
+first, so checking only the first rows misses it.
 
 Empirically (torch 2.12, macOS 26, Apple M5 Pro, 12 heads, head_dim 128):
 
