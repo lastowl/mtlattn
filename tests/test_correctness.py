@@ -134,6 +134,33 @@ def run_sdpa_case(name, B, Hq, Hkv, N, D, dtype, atol, causal=False):
     return ok
 
 
+def run_padding_case(name, B, H, N, D, Ls, dtype, atol, causal=False):
+    """replace_sdpa() converting a self-attention key-padding mask to varlen,
+    vs the fp32 varlen reference over the packed valid tokens."""
+    import torch.nn.functional as F
+    torch.manual_seed(0)
+    q = torch.randn(B, H, N, D, dtype=dtype)
+    k = torch.randn(B, H, N, D, dtype=dtype)
+    v = torch.randn(B, H, N, D, dtype=dtype)
+    scale = 1.0 / math.sqrt(D)
+    pack = lambda x: torch.cat([x[b, :, :Ls[b], :].transpose(0, 1) for b in range(B)], 0)
+    ref = ref_varlen(pack(q), pack(k), pack(v), Ls, Ls, scale, causal)
+    mask = torch.zeros(B, 1, 1, N, dtype=torch.bool)
+    for b, Lb in enumerate(Ls):
+        mask[b, 0, 0, :Lb] = True
+    mtlattn.replace_sdpa(min_seqlen=1)
+    try:
+        out = F.scaled_dot_product_attention(q.to("mps"), k.to("mps"), v.to("mps"),
+                                             attn_mask=mask.to("mps"), is_causal=causal).cpu().float()
+    finally:
+        mtlattn.restore_sdpa()
+    outp = torch.cat([out[b, :, :Ls[b], :].transpose(0, 1) for b in range(B)], 0)
+    err = (outp - ref.float()).abs().max().item()
+    ok = err < atol
+    print(f"{name}: max_err={err:.2e} (atol={atol}) {'OK' if ok else 'FAIL'}")
+    return ok
+
+
 def main():
     results = []
     # dtype -> tolerance (inputs are random N(0,1); fp16/bf16 storage rounding
@@ -180,6 +207,10 @@ def main():
     results.append(run_sdpa_case("sdpa MHA B2", 2, 8, 8, 1024, 128, torch.float16, 5e-3))
     results.append(run_sdpa_case("sdpa GQA B1", 1, 8, 2, 2048, 128, torch.float16, 5e-3))
     results.append(run_sdpa_case("sdpa causal", 2, 12, 12, 512, 128, torch.float16, 5e-3, causal=True))
+
+    # replace_sdpa key-padding mask -> varlen conversion (full and causal).
+    results.append(run_padding_case("pad mask", 4, 8, 1024, 128, [1024, 800, 500, 1024], torch.float16, 5e-3))
+    results.append(run_padding_case("pad mask causal", 3, 12, 1024, 128, [1024, 700, 400], torch.float16, 5e-3, causal=True))
     # outlier channels (real transformer activations spike to 1e2-1e3; QK
     # partial sums must not overflow — caught a NaN bug in half fragments)
     torch.manual_seed(3)

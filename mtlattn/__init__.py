@@ -94,20 +94,16 @@ def sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scal
     return out.reshape(B, Nq, Hq, D).permute(0, 2, 1, 3).contiguous()
 
 
-def _can_handle(query, key, value, attn_mask, dropout_p, is_causal, min_seqlen):
+def _basic_ok(query, key, value, dropout_p, min_seqlen):
     if query.device.type != "mps" or query.dim() != 4:
         return False
-    if dropout_p != 0.0 or attn_mask is not None:   # arbitrary masks: not yet
+    if dropout_p != 0.0:
         return False
     if query.dtype not in (torch.float16, torch.bfloat16, torch.float32):
         return False
     if query.shape[-1] > 128 or key.shape[-1] > 128:
         return False
     if key.shape[1] == 0 or query.shape[1] % key.shape[1] != 0:  # GQA divisibility
-        return False
-    # is_causal with q_len != kv_len: our end-aligned convention may differ
-    # from native top-left; stay safe and let native handle it.
-    if is_causal and query.shape[2] != key.shape[2]:
         return False
     # No backward pass: never intercept when autograd needs gradients.
     if torch.is_grad_enabled() and (query.requires_grad or key.requires_grad or value.requires_grad):
@@ -116,14 +112,64 @@ def _can_handle(query, key, value, attn_mask, dropout_p, is_causal, min_seqlen):
     return query.shape[2] >= min_seqlen
 
 
+def _try_padding_varlen(query, key, value, attn_mask, is_causal, scale):
+    """If attn_mask is a self-attention key-padding mask (per-batch, query- and
+    head-independent, with the valid keys a contiguous prefix), pack the valid
+    tokens and run varlen — exactly what cu_seqlens is for, so padded compute is
+    skipped. Returns the dense [B,H,N,D] result (padded query rows zeroed, which
+    are ignored downstream) or None if the mask isn't a convertible padding mask.
+    """
+    B, Hq, Nq, D = query.shape
+    Hkv, Nkv = key.shape[1], key.shape[2]
+    if Nq != Nkv:                                  # token-level padding => self-attn
+        return None
+    keep = attn_mask if attn_mask.dtype == torch.bool else (attn_mask > -1e30)
+    try:
+        keep = keep.expand(B, Hq, Nq, Nkv)
+    except RuntimeError:
+        return None
+    kv_keep = keep[:, 0, 0, :]                      # [B, Nkv]
+    if not torch.equal(keep, kv_keep[:, None, None, :].expand(B, Hq, Nq, Nkv)):
+        return None                                # depends on query/head: not padding
+    idx = torch.arange(Nkv, device=query.device)
+    L = kv_keep.sum(dim=1)                          # valid length per batch
+    if not torch.equal(kv_keep, idx[None, :] < L[:, None]):
+        return None                                # not a contiguous prefix
+    Ls = L.to(torch.int64).tolist()
+    total = int(sum(Ls))
+    if total == 0:
+        return query.new_zeros(B, Hq, Nq, D)
+    cu = torch.zeros(B + 1, dtype=torch.int32, device=query.device)
+    cu[1:] = torch.cumsum(L.to(torch.int32), 0)
+    qp, kp = query.new_empty(total, Hq, D), key.new_empty(total, Hkv, D)
+    vp = value.new_empty(total, Hkv, D)
+    off = 0
+    for b in range(B):
+        Lb = Ls[b]
+        if Lb:
+            qp[off:off + Lb] = query[b, :, :Lb, :].transpose(0, 1)
+            kp[off:off + Lb] = key[b, :, :Lb, :].transpose(0, 1)
+            vp[off:off + Lb] = value[b, :, :Lb, :].transpose(0, 1)
+            off += Lb
+    op = varlen_attention(qp, kp, vp, cu, cu, max(Ls), scale, causal=is_causal)
+    out = query.new_zeros(B, Hq, Nq, D)
+    off = 0
+    for b in range(B):
+        Lb = Ls[b]
+        if Lb:
+            out[b, :, :Lb, :] = op[off:off + Lb].transpose(0, 1)
+            off += Lb
+    return out
+
+
 def replace_sdpa(min_seqlen=_SDPA_MIN_SEQLEN):
     """Monkey-patch torch.nn.functional.scaled_dot_product_attention so any
     PyTorch/HF model transparently uses mtlattn on the large/ragged forward
     calls it wins on, falling back to native SDPA otherwise (small shapes,
-    autograd/training, attn_mask, unsupported dtype/head_dim). Idempotent.
-    Note: only affects callers that reach F.scaled_dot_product_attention at
-    call time (most HF attention does); modules holding a direct import of the
-    symbol are unaffected."""
+    autograd/training, unsupported dtype/head_dim). A self-attention key-padding
+    attn_mask is converted to varlen; any other mask falls back. Idempotent.
+    Note: only affects callers that reach F.scaled_dot_product_attention at call
+    time (most HF attention does); modules holding a direct import are unaffected."""
     global _ORIG_SDPA
     if _ORIG_SDPA is None:
         _ORIG_SDPA = torch.nn.functional.scaled_dot_product_attention
@@ -131,8 +177,16 @@ def replace_sdpa(min_seqlen=_SDPA_MIN_SEQLEN):
 
     def patched(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False,
                 scale=None, **kwargs):
-        if _can_handle(query, key, value, attn_mask, dropout_p, is_causal, min_seqlen):
-            return sdpa(query, key, value, attn_mask, dropout_p, is_causal, scale)
+        if _basic_ok(query, key, value, dropout_p, min_seqlen):
+            sc = scale if scale is not None else 1.0 / math.sqrt(query.shape[-1])
+            if attn_mask is None:
+                # end-aligned causal only well-defined when q_len == kv_len here.
+                if not (is_causal and query.shape[2] != key.shape[2]):
+                    return sdpa(query, key, value, None, dropout_p, is_causal, scale)
+            else:
+                r = _try_padding_varlen(query, key, value, attn_mask, is_causal, sc)
+                if r is not None:
+                    return r
         return orig(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p,
                     is_causal=is_causal, scale=scale, **kwargs)
 

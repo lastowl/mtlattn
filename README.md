@@ -84,9 +84,15 @@ mtlattn.restore_sdpa()   # undo
 `replace_sdpa()` routes dense `[B, H, N, D]` attention to mtlattn only where it
 wins — long/ragged sequences, and the cases native MPS SDPA pads, OOMs, or hits
 the `>2^32` MPSGraph bug on — and falls back to native SDPA otherwise (small
-shapes, autograd/training, `attn_mask`, unsupported dtype/head_dim). The
-crossover length is `replace_sdpa(min_seqlen=...)`. `mtlattn.sdpa(...)` is the
-same adapter callable directly.
+shapes, autograd/training, unsupported dtype/head_dim). A self-attention
+**key-padding `attn_mask`** is converted to varlen (the valid tokens are packed
+and the padding is skipped, not just masked); any other `attn_mask` falls back.
+The crossover length is `replace_sdpa(min_seqlen=...)`. `mtlattn.sdpa(...)` is
+the same adapter callable directly.
+
+(Arbitrary per-position `attn_mask` support in the kernel itself — prefix-LM,
+custom patterns — is on the roadmap; today only padding/causal/window are
+accelerated.)
 
 `head_dim <= 128`. Forward only (inference); no backward pass.
 
