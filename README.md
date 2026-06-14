@@ -71,6 +71,23 @@ out = mtlattn.flash_attn_varlen_qkvpacked_func(qkv, cu_seqlens, max_seqlen)
 out = mtlattn.flash_attn_varlen_kvpacked_func(q, kv, cu_q, cu_k, max_q, max_k)
 ```
 
+### Drop-in for `scaled_dot_product_attention`
+
+```python
+import mtlattn
+
+mtlattn.replace_sdpa()   # patches F.scaled_dot_product_attention globally
+# ... run any PyTorch/HF model on MPS; large forward calls now use mtlattn ...
+mtlattn.restore_sdpa()   # undo
+```
+
+`replace_sdpa()` routes dense `[B, H, N, D]` attention to mtlattn only where it
+wins — long/ragged sequences, and the cases native MPS SDPA pads, OOMs, or hits
+the `>2^32` MPSGraph bug on — and falls back to native SDPA otherwise (small
+shapes, autograd/training, `attn_mask`, unsupported dtype/head_dim). The
+crossover length is `replace_sdpa(min_seqlen=...)`. `mtlattn.sdpa(...)` is the
+same adapter callable directly.
+
 `head_dim <= 128`. Forward only (inference); no backward pass.
 
 ## Performance
@@ -97,11 +114,12 @@ SDPA needs 54 GiB, and is correct where SDPA silently corrupts (see below).
 
 ## Correctness
 
-`python tests/test_correctness.py` — 14 cases vs a per-sequence fp32
+`python tests/test_correctness.py` — 29 cases vs a per-sequence fp32
 reference across fp16/bf16/fp32, ragged self/cross attention, packed forms,
-odd head dims, thousands of tiny windows, and an outlier-channel overflow
-regression (transformer activations spike to ~10²–10³; fp32 fragment
-accumulation is required — half fragments overflow to NaN).
+odd head dims, thousands of tiny windows, causal / GQA-MQA / sliding-window
+(and their combinations), and an outlier-channel overflow regression
+(transformer activations spike to ~10²–10³; fp32 fragment accumulation is
+required — half fragments overflow to NaN).
 
 ## Notes
 
@@ -111,7 +129,19 @@ accumulation is required — half fragments overflow to NaN).
 - The kernel encodes into PyTorch's `MPSStream`, so it sequences correctly
   with surrounding torch ops without a per-call CPU sync.
 
+## Credits
+
+- The torch↔Metal buffer bridge pattern follows
+  [Pedro Naugusto's mtlgemm](https://github.com/pedronaugusto/mtlgemm).
+- The MPP path targets the M5 Neural Accelerator via Metal 4 `matmul2d`;
+  the simdgroup fallback draws on the tiling approach of
+  [Philip Turner's metal-flash-attention](https://github.com/philipturner/metal-flash-attention).
+- The `replace_sdpa()` drop-in and the causal / GQA / sliding-window feature
+  set were inspired by
+  [mpsops/mps-flash-attention](https://github.com/mpsops/mps-flash-attention),
+  a related flash-attention-for-PyTorch-MPS project; mtlattn's own focus is
+  variable-length (`cu_seqlens`) attention and the M5 accelerator path.
+
 ## License
 
-MIT. The torch↔Metal buffer bridge pattern follows
-[Pedro Naugusto's mtlgemm](https://github.com/pedronaugusto/mtlgemm).
+MIT.

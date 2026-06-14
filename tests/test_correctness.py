@@ -114,6 +114,26 @@ def run_gqa_case(name, q_lens, kv_lens, Hq, Hkv, D, dtype, atol, causal=False):
     return ok
 
 
+def run_sdpa_case(name, B, Hq, Hkv, N, D, dtype, atol, causal=False):
+    """Dense [B,H,N,D] mtlattn.sdpa() adapter vs the fp32 varlen reference."""
+    torch.manual_seed(0)
+    q = torch.randn(B, Hq, N, D, dtype=dtype)
+    k = torch.randn(B, Hkv, N, D, dtype=dtype)
+    v = torch.randn(B, Hkv, N, D, dtype=dtype)
+    scale = 1.0 / math.sqrt(D)
+    g = Hq // Hkv
+    qf = q.permute(0, 2, 1, 3).reshape(B * N, Hq, D)
+    kf = k.repeat_interleave(g, 1).permute(0, 2, 1, 3).reshape(B * N, Hq, D)
+    vf = v.repeat_interleave(g, 1).permute(0, 2, 1, 3).reshape(B * N, Hq, D)
+    ref = ref_varlen(qf, kf, vf, [N] * B, [N] * B, scale, causal)
+    ref = ref.reshape(B, N, Hq, D).permute(0, 2, 1, 3)
+    out = mtlattn.sdpa(q.to("mps"), k.to("mps"), v.to("mps"), is_causal=causal).cpu().float()
+    err = (out - ref.float()).abs().max().item()
+    ok = err < atol
+    print(f"{name}: max_err={err:.2e} (atol={atol}) {'OK' if ok else 'FAIL'}")
+    return ok
+
+
 def main():
     results = []
     # dtype -> tolerance (inputs are random N(0,1); fp16/bf16 storage rounding
@@ -155,6 +175,11 @@ def main():
     results.append(run_case("SWA w>=len (no-op)", [200], [200], 8, 128, torch.float16, 5e-3, causal=True, window=512))
     results.append(run_case("SWA non-causal band", [256], [256], 8, 128, torch.float16, 5e-3, causal=False, window=48))
     results.append(run_case("SWA D=64", [300, 40], [300, 40], 16, 64, torch.float16, 5e-3, causal=True, window=80))
+
+    # Dense scaled_dot_product_attention adapter (mtlattn.sdpa): MHA, GQA, causal.
+    results.append(run_sdpa_case("sdpa MHA B2", 2, 8, 8, 1024, 128, torch.float16, 5e-3))
+    results.append(run_sdpa_case("sdpa GQA B1", 1, 8, 2, 2048, 128, torch.float16, 5e-3))
+    results.append(run_sdpa_case("sdpa causal", 2, 12, 12, 512, 128, torch.float16, 5e-3, causal=True))
     # outlier channels (real transformer activations spike to 1e2-1e3; QK
     # partial sums must not overflow — caught a NaN bug in half fragments)
     torch.manual_seed(3)
