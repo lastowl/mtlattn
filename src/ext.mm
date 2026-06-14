@@ -39,6 +39,7 @@ struct Params {
 struct Context {
     id<MTLDevice> device = nil;
     id<MTLLibrary> library = nil;
+    id<MTLLibrary> mpp_library = nil;  // optional Metal-4 MPP path (M5 + macOS 26.2+)
     std::unordered_map<std::string, id<MTLComputePipelineState>> cache;
 
     static Context& instance() {
@@ -50,20 +51,26 @@ struct Context {
         device = MTLCreateSystemDefaultDevice();
         TORCH_CHECK(device != nil, "mtlattn: no Metal device");
 
-        NSString* libPath = nil;
+        NSString* dir = nil;
         @autoreleasepool {
             Dl_info info;
             if (dladdr((void*)&Context::instance, &info)) {
                 NSString* soPath = [NSString stringWithUTF8String:info.dli_fname];
-                libPath = [[soPath stringByDeletingLastPathComponent]
-                    stringByAppendingPathComponent:@"mtlattn.metallib"];
+                dir = [soPath stringByDeletingLastPathComponent];
             }
         }
-        TORCH_CHECK(libPath != nil, "mtlattn: could not locate metallib");
+        TORCH_CHECK(dir != nil, "mtlattn: could not locate metallib");
         NSError* error = nil;
-        library = [device newLibraryWithURL:[NSURL fileURLWithPath:libPath] error:&error];
+        library = [device newLibraryWithURL:[NSURL fileURLWithPath:[dir stringByAppendingPathComponent:@"mtlattn.metallib"]] error:&error];
         TORCH_CHECK(library != nil, "mtlattn: failed to load metallib: ",
                     error ? [[error localizedDescription] UTF8String] : "?");
+        // MPP metallib is optional — absent / fails to load on pre-M5 or pre-26.2.
+        @autoreleasepool {
+            NSError* e2 = nil;
+            NSString* mp = [dir stringByAppendingPathComponent:@"mtlattn_mpp.metallib"];
+            if ([[NSFileManager defaultManager] fileExistsAtPath:mp])
+                mpp_library = [device newLibraryWithURL:[NSURL fileURLWithPath:mp] error:&e2];
+        }
     }
 
     id<MTLComputePipelineState> pipeline(const std::string& name) {
@@ -79,7 +86,62 @@ struct Context {
         cache[name] = pso;
         return pso;
     }
+
+    // Returns nil if MPP unavailable (caller falls back to the simdgroup path).
+    id<MTLComputePipelineState> mpp_pipeline(const std::string& name) {
+        if (mpp_library == nil) return nil;
+        auto it = cache.find(name);
+        if (it != cache.end()) return it->second;
+        id<MTLFunction> func = [mpp_library newFunctionWithName:[NSString stringWithUTF8String:name.c_str()]];
+        if (func == nil) return nil;
+        NSError* error = nil;
+        id<MTLComputePipelineState> pso = [device newComputePipelineStateWithFunction:func error:&error];
+        if (pso == nil) return nil;
+        cache[name] = pso;
+        return pso;
+    }
 };
+
+// MPP (M5 Neural Accelerator) varlen fast-path. Returns true if it handled the
+// call. Conditions: MPP metallib present, head_dim==128, dtype half/bfloat,
+// head stride == D (contiguous heads). ~4-7x the simdgroup path on M5.
+static bool try_mpp_varlen(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
+                           at::Tensor& out, const at::Tensor& cu_q, const at::Tensor& cu_kv,
+                           int64_t H, int64_t D, int64_t max_seqlen_q, double scale) {
+    if (D != 128) return false;
+    auto st = q.scalar_type();
+    if (st != at::kHalf && st != at::kBFloat16) return false;
+    auto& ctx = Context::instance();
+    auto pso = ctx.mpp_pipeline(st == at::kHalf ? "attn_mpp_varlen_half" : "attn_mpp_varlen_bfloat");
+    if (pso == nil) return false;
+    if (q.stride(1) != D || k.stride(1) != D || v.stride(1) != D) return false;  // contiguous-head only
+
+    const int64_t B = cu_q.numel() - 1;
+    uint32_t Hh = (uint32_t)H; float sc = (float)scale;
+    uint32_t qtiles = ((uint32_t)max_seqlen_q + 15) / 16;
+    id<MTLBuffer> qb=at::native::mps::getMTLBufferStorage(q), kb=at::native::mps::getMTLBufferStorage(k),
+                  vb=at::native::mps::getMTLBufferStorage(v), ob=at::native::mps::getMTLBufferStorage(out),
+                  cqb=at::native::mps::getMTLBufferStorage(cu_q), ckb=at::native::mps::getMTLBufferStorage(cu_kv);
+    NSUInteger es = q.element_size();
+    NSUInteger qo=q.storage_offset()*es, ko=k.storage_offset()*es, vo=v.storage_offset()*es, oo=out.storage_offset()*es,
+               cqo=cu_q.storage_offset()*4, cko=cu_kv.storage_offset()*4;
+    auto* stream = at::mps::getCurrentMPSStream();
+    MTLSize tg = MTLSizeMake(qtiles, (NSUInteger)B, (NSUInteger)H);
+    MTLSize tpt = MTLSizeMake(pso.threadExecutionWidth * 4, 1, 1);
+    at::mps::dispatch_sync_with_rethrow(stream->queue(), ^() {
+        @autoreleasepool {
+            stream->endKernelCoalescing();
+            id<MTLComputeCommandEncoder> enc = [stream->commandBuffer() computeCommandEncoder];
+            [enc setComputePipelineState:pso];
+            [enc setBuffer:qb offset:qo atIndex:0]; [enc setBuffer:kb offset:ko atIndex:1]; [enc setBuffer:vb offset:vo atIndex:2];
+            [enc setBuffer:ob offset:oo atIndex:3]; [enc setBuffer:cqb offset:cqo atIndex:4]; [enc setBuffer:ckb offset:cko atIndex:5];
+            [enc setBytes:&Hh length:4 atIndex:6]; [enc setBytes:&sc length:4 atIndex:7];
+            [enc dispatchThreadgroups:tg threadsPerThreadgroup:tpt];
+            [enc endEncoding];
+        }
+    });
+    return true;
+}
 
 struct KernelCfg {
     const char* name;
@@ -135,6 +197,14 @@ at::Tensor varlen_attention(
     auto cu_kv = cu_seqlens_kv.contiguous();
 
     auto out = at::empty({q.size(0), H, D}, q.options());
+
+    // Metal-4 MPP fast-path (M5 Neural Accelerator). Falls through on any
+    // machine/shape it can't handle, to the portable simdgroup kernel below.
+    if (q.size(0) > 0 && !std::getenv("MTLATTN_NO_MPP")) {
+        auto qc = q.contiguous(), kc = k.contiguous(), vc = v.contiguous();
+        if (try_mpp_varlen(qc, kc, vc, out, cu_q, cu_kv, H, D, max_seqlen_q, scale))
+            return out;
+    }
 
     Params p;
     p.num_heads = (uint32_t)H;

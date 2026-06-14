@@ -36,18 +36,31 @@ class MetalBuildExt(build_ext):
         build_temp = os.path.join(self.build_temp, "metal")
         os.makedirs(build_temp, exist_ok=True)
 
+        # Portable simdgroup kernel (metal3.1, runs on M1+). MPP kernel is
+        # built separately at metal4.0 below.
         air_files = []
         for src in glob.glob(os.path.join(SRC_DIR, "*.metal")):
+            if os.path.basename(src) == "attn_mpp.metal":
+                continue
             air = os.path.join(build_temp, os.path.basename(src).replace(".metal", ".air"))
-            subprocess.check_call([
-                "xcrun", "-sdk", "macosx", "metal",
-                "-c", src, "-o", air,
-                "-std=metal3.1", "-O2",
-            ])
+            subprocess.check_call(["xcrun", "-sdk", "macosx", "metal", "-c", src, "-o", air, "-std=metal3.1", "-O2"])
             air_files.append(air)
-
         metallib = os.path.join(build_temp, "mtlattn.metallib")
         subprocess.check_call(["xcrun", "-sdk", "macosx", "metallib"] + air_files + ["-o", metallib])
+
+        # Optional Metal-4 MPP kernel (M5 Neural Accelerator, macOS 26.2+ at
+        # runtime). Best-effort: skip if this toolchain can't build metal4.0.
+        mpp_metallib = None
+        mpp_src = os.path.join(SRC_DIR, "attn_mpp.metal")
+        if os.path.exists(mpp_src):
+            try:
+                mpp_air = os.path.join(build_temp, "attn_mpp.air")
+                subprocess.check_call(["xcrun", "-sdk", "macosx", "metal", "-c", mpp_src, "-o", mpp_air, "-std=metal4.0", "-O3"])
+                mpp_metallib = os.path.join(build_temp, "mtlattn_mpp.metallib")
+                subprocess.check_call(["xcrun", "-sdk", "macosx", "metallib", mpp_air, "-o", mpp_metallib])
+            except subprocess.CalledProcessError:
+                print("  mtlattn: metal4.0 MPP kernel not buildable on this toolchain; M5 fast-path disabled")
+                mpp_metallib = None
 
         for ext in self.extensions:
             if hasattr(ext, "_resolve_torch"):
@@ -58,6 +71,8 @@ class MetalBuildExt(build_ext):
             ext_dir = os.path.dirname(self.get_ext_fullpath(ext.name))
             os.makedirs(ext_dir, exist_ok=True)
             shutil.copy2(metallib, os.path.join(ext_dir, "mtlattn.metallib"))
+            if mpp_metallib:
+                shutil.copy2(mpp_metallib, os.path.join(ext_dir, "mtlattn_mpp.metallib"))
 
 
 class LazyMetalExtension(Extension):
@@ -93,6 +108,7 @@ ext = LazyMetalExtension(
     extra_link_args=[
         "-framework", "Metal",
         "-framework", "Foundation",
+        "-framework", "MetalPerformancePrimitives",
         "-Wl,-rpath,@loader_path",
     ],
     language="objc++",
