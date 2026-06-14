@@ -36,6 +36,7 @@ struct Params {
     uint32_t o_row_stride;
     uint32_t causal;      // 0 = full attention; 1 = causal mask
     uint32_t gqa_group;   // query heads per kv head (1 = standard MHA)
+    uint32_t window;      // 0 = unlimited; >0 = sliding window (last `window` keys)
 };
 
 struct Context {
@@ -110,7 +111,7 @@ struct Context {
 static bool try_mpp_varlen(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
                            at::Tensor& out, const at::Tensor& cu_q, const at::Tensor& cu_kv,
                            int64_t H, int64_t D, int64_t max_seqlen_q, double scale,
-                           uint32_t causal, uint32_t gqa_group) {
+                           uint32_t causal, uint32_t gqa_group, uint32_t window) {
     if (D != 128) return false;
     auto st = q.scalar_type();
     if (st != at::kHalf && st != at::kBFloat16) return false;
@@ -151,6 +152,7 @@ static bool try_mpp_varlen(const at::Tensor& q, const at::Tensor& k, const at::T
             [enc setBytes:&qrs length:4 atIndex:8]; [enc setBytes:&krs length:4 atIndex:9]; [enc setBytes:&vrs length:4 atIndex:10];
             [enc setBytes:&causal length:4 atIndex:11];
             [enc setBytes:&gqa_group length:4 atIndex:12];
+            [enc setBytes:&window length:4 atIndex:13];
             [enc dispatchThreadgroups:tg threadsPerThreadgroup:tpt];
             [enc endEncoding];
         }
@@ -184,7 +186,8 @@ at::Tensor varlen_attention(
     const at::Tensor& cu_seqlens_kv,
     int64_t max_seqlen_q,
     double scale,
-    bool causal
+    bool causal,
+    int64_t window
 ) {
     TORCH_CHECK(q.device().is_mps() && k.device().is_mps() && v.device().is_mps(),
                 "mtlattn: q/k/v must be MPS tensors");
@@ -221,7 +224,8 @@ at::Tensor varlen_attention(
     // Metal-4 MPP fast-path (M5 Neural Accelerator). Falls through on any
     // machine/shape it can't handle, to the portable simdgroup kernel below.
     if (q.size(0) > 0 && !std::getenv("MTLATTN_NO_MPP")) {
-        if (try_mpp_varlen(q, k, v, out, cu_q, cu_kv, H, D, max_seqlen_q, scale, causal ? 1u : 0u, gqa_group))
+        if (try_mpp_varlen(q, k, v, out, cu_q, cu_kv, H, D, max_seqlen_q, scale,
+                           causal ? 1u : 0u, gqa_group, (uint32_t)(window > 0 ? window : 0)))
             return out;
     }
 
@@ -235,6 +239,7 @@ at::Tensor varlen_attention(
     p.o_row_stride = (uint32_t)(H * D);
     p.causal = causal ? 1u : 0u;
     p.gqa_group = gqa_group;
+    p.window = (uint32_t)(window > 0 ? window : 0);
 
     auto& ctx = Context::instance();
     const KernelCfg cfg = kernel_for_dtype(q.scalar_type());
@@ -287,5 +292,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Fused varlen attention forward (MPS)",
           py::arg("q"), py::arg("k"), py::arg("v"),
           py::arg("cu_seqlens_q"), py::arg("cu_seqlens_kv"),
-          py::arg("max_seqlen_q"), py::arg("scale"), py::arg("causal") = false);
+          py::arg("max_seqlen_q"), py::arg("scale"), py::arg("causal") = false,
+          py::arg("window") = 0);
 }

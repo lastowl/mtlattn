@@ -164,7 +164,7 @@ kernel void attn_mpp_flash(
 template <typename T, int TM, int TN, int D, int SG>
 inline void attn_vl(device const T* Q, device const T* K, device const T* V, device T* O,
                     device const int* cu_q, device const int* cu_kv, uint H, float scale,
-                    uint q_rs, uint k_rs, uint v_rs, uint causal, uint g,
+                    uint q_rs, uint k_rs, uint v_rs, uint causal, uint g, uint window,
                     threadgroup float* Sb, threadgroup T* Pb, threadgroup float* PVb,
                     threadgroup float* Ob, threadgroup float* mb, threadgroup float* lb, threadgroup float* cb,
                     uint tid, uint qtile, uint seq, uint head)
@@ -197,7 +197,15 @@ inline void attn_vl(device const T* Q, device const T* K, device const T* V, dev
     for (uint r = tid; r < TM; r += NT) { mb[r] = -INFINITY; lb[r] = 0.0f; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (int kv = kv_start; kv < kv_end; kv += TN) {
+    // Sliding window: query i attends keys (diag_i - window, diag_i]. The whole
+    // block's band starts at row 0's window bottom, so jump the loop there
+    // (windowed attention costs O(window), not O(seqlen)).
+    int kv0 = kv_start;
+    if (window > 0) {
+        int s = (q0 - q_start) + coff - int(window) + 1;     // lowest key any row needs
+        if (s > 0) kv0 = kv_start + (s / int(TN)) * int(TN);
+    }
+    for (int kv = kv0; kv < kv_end; kv += TN) {
         if (causal && (kv - kv_start) > q_hi) break;   // tile fully beyond horizon
         int tk = min(TN, kv_end - kv);
         const int kvbase = kv - kv_start;              // seq-pos of first key in tile
@@ -210,10 +218,14 @@ inline void attn_vl(device const T* Q, device const T* K, device const T* V, dev
         for (uint r = tid; r < TM; r += NT) {
             int lim = tk;
             if (causal) { int h = (q0 - q_start) + int(r) + coff - kvbase + 1; lim = clamp(h, 0, tk); }
+            int lo = 0;
+            if (window > 0) { int dl = (q0 - q_start) + int(r) + coff - int(window) + 1 - kvbase; lo = clamp(dl, 0, lim); }
             float m_old = mb[r], tmax = m_old;
-            for (int c = 0; c < lim; ++c) tmax = max(tmax, Sb[r*TN+c]*scale);
-            float corr = exp(m_old - tmax), tsum = 0.0f;
-            for (uint c = 0; c < TN; ++c) { float w=(int(c)<lim)?exp(Sb[r*TN+c]*scale-tmax):0.0f; tsum+=w; Pb[r*TN+c]=T(w); }
+            for (int c = lo; c < lim; ++c) tmax = max(tmax, Sb[r*TN+c]*scale);
+            // tmax stays -inf when this tile has no keys for the row (windowed
+            // band skips it); rescale is then a no-op (1), not exp(-inf+inf)=NaN.
+            float corr = (tmax == -INFINITY) ? 1.0f : exp(m_old - tmax), tsum = 0.0f;
+            for (uint c = 0; c < TN; ++c) { float w=((int(c)>=lo)&&(int(c)<lim))?exp(Sb[r*TN+c]*scale-tmax):0.0f; tsum+=w; Pb[r*TN+c]=T(w); }
             mb[r] = tmax; lb[r] = lb[r]*corr + tsum; cb[r] = corr;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -238,13 +250,14 @@ kernel void attn_mpp_varlen_half(
     constant uint& H [[buffer(6)]], constant float& scale [[buffer(7)]],
     constant uint& q_rs [[buffer(8)]], constant uint& k_rs [[buffer(9)]], constant uint& v_rs [[buffer(10)]],
     constant uint& causal [[buffer(11)]], constant uint& g [[buffer(12)]],
+    constant uint& window [[buffer(13)]],
     uint tid [[thread_index_in_threadgroup]], uint3 tgid [[threadgroup_position_in_grid]])
 {
     constexpr int TM=16,TN=64,D=128,SG=4;
     threadgroup float Sb[TM*TN]; threadgroup half Pb[TM*TN];
     threadgroup float PVb[TM*D]; threadgroup float Ob[TM*D];
     threadgroup float mb[TM], lb[TM], cb[TM];
-    attn_vl<half,TM,TN,D,SG>(Q,K,V,O,cu_q,cu_kv,H,scale,q_rs,k_rs,v_rs,causal,g,Sb,Pb,PVb,Ob,mb,lb,cb,tid,tgid.x,tgid.y,tgid.z);
+    attn_vl<half,TM,TN,D,SG>(Q,K,V,O,cu_q,cu_kv,H,scale,q_rs,k_rs,v_rs,causal,g,window,Sb,Pb,PVb,Ob,mb,lb,cb,tid,tgid.x,tgid.y,tgid.z);
 }
 
 kernel void attn_mpp_varlen_bfloat(
@@ -253,13 +266,14 @@ kernel void attn_mpp_varlen_bfloat(
     constant uint& H [[buffer(6)]], constant float& scale [[buffer(7)]],
     constant uint& q_rs [[buffer(8)]], constant uint& k_rs [[buffer(9)]], constant uint& v_rs [[buffer(10)]],
     constant uint& causal [[buffer(11)]], constant uint& g [[buffer(12)]],
+    constant uint& window [[buffer(13)]],
     uint tid [[thread_index_in_threadgroup]], uint3 tgid [[threadgroup_position_in_grid]])
 {
     constexpr int TM=16,TN=64,D=128,SG=4;
     threadgroup float Sb[TM*TN]; threadgroup bfloat Pb[TM*TN];
     threadgroup float PVb[TM*D]; threadgroup float Ob[TM*D];
     threadgroup float mb[TM], lb[TM], cb[TM];
-    attn_vl<bfloat,TM,TN,D,SG>(Q,K,V,O,cu_q,cu_kv,H,scale,q_rs,k_rs,v_rs,causal,g,Sb,Pb,PVb,Ob,mb,lb,cb,tid,tgid.x,tgid.y,tgid.z);
+    attn_vl<bfloat,TM,TN,D,SG>(Q,K,V,O,cu_q,cu_kv,H,scale,q_rs,k_rs,v_rs,causal,g,window,Sb,Pb,PVb,Ob,mb,lb,cb,tid,tgid.x,tgid.y,tgid.z);
 }
 
 // ---- TM=64 variant with register-resident O (cooperative_tensor) ----

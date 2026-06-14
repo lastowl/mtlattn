@@ -8,9 +8,10 @@ import torch
 import mtlattn
 
 
-def ref_varlen(q, k, v, q_lens, kv_lens, scale, causal=False):
+def ref_varlen(q, k, v, q_lens, kv_lens, scale, causal=False, window=0):
     """Per-sequence fp32 SDPA on CPU. causal: key j seen by query i iff
-    j <= i + (kv_len - q_len) (flash_attn end-aligned convention)."""
+    j <= i + (kv_len - q_len) (flash_attn end-aligned convention). window>0:
+    additionally j > i + (kv_len - q_len) - window (sliding window)."""
     out = torch.empty_like(q, dtype=torch.float32)
     qo = kvo = 0
     for ql, kl in zip(q_lens, kv_lens):
@@ -18,10 +19,16 @@ def ref_varlen(q, k, v, q_lens, kv_lens, scale, causal=False):
         ki = k[kvo:kvo + kl].float().permute(1, 0, 2)
         vi = v[kvo:kvo + kl].float().permute(1, 0, 2)
         a = (qi @ ki.transpose(-1, -2)) * scale
+        i = torch.arange(ql)[:, None]
+        j = torch.arange(kl)[None, :]
+        coff = kl - ql
+        mask = torch.ones(ql, kl, dtype=torch.bool)
         if causal:
-            i = torch.arange(ql)[:, None]
-            j = torch.arange(kl)[None, :]
-            a = a.masked_fill(~(j <= i + (kl - ql)), float("-inf"))
+            mask &= (j <= i + coff)
+        if window > 0:
+            mask &= (j > i + coff - window)
+        if causal or window > 0:
+            a = a.masked_fill(~mask, float("-inf"))
         out[qo:qo + ql] = (a.softmax(-1) @ vi).permute(1, 0, 2)
         qo += ql
         kvo += kl
@@ -33,7 +40,7 @@ def cu(lens):
     return torch.cumsum(t, 0).int().to("mps")
 
 
-def run_case(name, q_lens, kv_lens, H, D, dtype, atol, causal=False):
+def run_case(name, q_lens, kv_lens, H, D, dtype, atol, causal=False, window=0):
     torch.manual_seed(0)
     Mq, Mkv = sum(q_lens), sum(kv_lens)
     q = torch.randn(Mq, H, D, dtype=dtype)
@@ -41,10 +48,10 @@ def run_case(name, q_lens, kv_lens, H, D, dtype, atol, causal=False):
     v = torch.randn(Mkv, H, D, dtype=dtype)
     scale = 1.0 / math.sqrt(D)
 
-    ref = ref_varlen(q, k, v, q_lens, kv_lens, scale, causal)
+    ref = ref_varlen(q, k, v, q_lens, kv_lens, scale, causal, window)
     out = mtlattn.varlen_attention(
         q.to("mps"), k.to("mps"), v.to("mps"),
-        cu(q_lens), cu(kv_lens), max(q_lens), scale, causal=causal,
+        cu(q_lens), cu(kv_lens), max(q_lens), scale, causal=causal, window=window,
     ).cpu().float()
 
     err = (out - ref).abs().max().item()
@@ -140,6 +147,14 @@ def main():
     results.append(run_gqa_case("GQA 8->2 causal", [400], [400], 8, 2, 128, torch.float16, 5e-3, causal=True))
     results.append(run_gqa_case("MQA cross cached", [16], [512], 8, 1, 128, torch.float16, 5e-3, causal=True))
     results.append(run_gqa_case("GQA 8->2 D=64", [200, 50], [200, 50], 8, 2, 64, torch.float16, 5e-3))
+
+    # Sliding-window / local attention. Mistral SWA = causal + window; also a
+    # ragged batch, a window >= seqlen (no-op), non-causal banded, and D=64.
+    results.append(run_case("SWA causal w=128 D=128", [1024], [1024], 12, 128, torch.float16, 5e-3, causal=True, window=128))
+    results.append(run_case("SWA causal ragged", [600, 50, 333], [600, 50, 333], 8, 128, torch.float16, 5e-3, causal=True, window=64))
+    results.append(run_case("SWA w>=len (no-op)", [200], [200], 8, 128, torch.float16, 5e-3, causal=True, window=512))
+    results.append(run_case("SWA non-causal band", [256], [256], 8, 128, torch.float16, 5e-3, causal=False, window=48))
+    results.append(run_case("SWA D=64", [300, 40], [300, 40], 16, 64, torch.float16, 5e-3, causal=True, window=80))
     # outlier channels (real transformer activations spike to 1e2-1e3; QK
     # partial sums must not overflow — caught a NaN bug in half fragments)
     torch.manual_seed(3)

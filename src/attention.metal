@@ -29,6 +29,7 @@ struct Params {
     uint o_row_stride;
     uint causal;        // 0 = full attention; 1 = causal mask
     uint gqa_group;     // query heads per kv head (1 = standard MHA)
+    uint window;        // 0 = unlimited; >0 = attend last `window` keys (SWA)
 };
 
 constant constexpr uint DMAX = 128;
@@ -104,7 +105,14 @@ void varlen_attn_impl(
 
     const uint sg_row0 = sgid * 8;          // block-local first row of this sg
 
-    for (int t0 = 0; t0 < kv_len; t0 += int(BK)) {
+    // Sliding window: jump the loop to row 0's window bottom so cost is
+    // O(window), not O(seqlen).
+    int t0_start = 0;
+    if (p.window > 0) {
+        int s = (q0 - q_start) + coff - int(p.window) + 1;   // lowest key any row needs
+        if (s > 0) t0_start = (s / int(BK)) * int(BK);
+    }
+    for (int t0 = t0_start; t0 < kv_len; t0 += int(BK)) {
         if (p.causal && t0 > q_hi) break;   // tile fully beyond causal horizon
         const int tk = min(int(BK), kv_len - t0);
 
@@ -154,16 +162,19 @@ void varlen_attn_impl(
             const uint r = sg_row0 + row_in_sg;
             int lim = tk;
             if (p.causal) { int h = (q0 - q_start) + int(r) + coff - t0 + 1; lim = clamp(h, 0, tk); }
+            int lo = 0;
+            if (p.window > 0) { int dl = (q0 - q_start) + int(r) + coff - int(p.window) + 1 - t0; lo = clamp(dl, 0, lim); }
             const float m_old = m_run[r];
             float lmax = m_old;
-            for (int kk = int(sub); kk < lim; kk += 4) lmax = max(lmax, Ss[r * BK + uint(kk)]);
+            for (int kk = int(sub); kk < lim; kk += 4) if (kk >= lo) lmax = max(lmax, Ss[r * BK + uint(kk)]);
             lmax = max(lmax, simd_shuffle_xor(lmax, 1u));
             lmax = max(lmax, simd_shuffle_xor(lmax, 2u));
             const float row_max = lmax;
-            const float c = exp(m_old - row_max);
+            // -inf when the windowed band skips this tile for the row: no-op (1).
+            const float c = (row_max == -INFINITY) ? 1.0f : exp(m_old - row_max);
             float lsum = 0.0f;
             for (uint kk = sub; kk < BK; kk += 4) {
-                float w = (int(kk) < lim) ? exp(Ss[r * BK + kk] - row_max) : 0.0f;
+                float w = (int(kk) >= lo && int(kk) < lim) ? exp(Ss[r * BK + kk] - row_max) : 0.0f;
                 lsum += w;
                 Ps[r * BK + kk] = T_f(w);
             }

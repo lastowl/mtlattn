@@ -61,6 +61,11 @@ out = mtlattn.varlen_attention(q, k, v, cu_seqlens_q, cu_seqlens_kv,
 # work). Fully-masked KV tiles are skipped, so causal self-attention is ~2x
 # faster than full.
 
+# window=W: sliding-window / local attention — query i attends only its last
+# W keys (relative to the causal diagonal). Mistral-style SWA is causal=True
+# with window=W. The kernel jumps straight to each block's window band, so
+# cost is O(W) not O(seqlen): ~7-14x faster than full at long sequences.
+
 # flash_attn-compatible wrappers (forward only):
 out = mtlattn.flash_attn_varlen_qkvpacked_func(qkv, cu_seqlens, max_seqlen)
 out = mtlattn.flash_attn_varlen_kvpacked_func(q, kv, cu_q, cu_k, max_q, max_k)
