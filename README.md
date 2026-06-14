@@ -1,14 +1,22 @@
 # mtlattn
 
-Fused **variable-length attention** (forward) for Apple Silicon, as a Metal
-compute kernel for PyTorch MPS tensors. A flash-attention-style kernel:
-online softmax, `simdgroup_matrix` tiling, fp32 accumulation, **no padding
+Fused **flash-attention (forward)** for Apple Silicon — a Metal compute kernel
+for PyTorch MPS tensors, with online softmax, fp32 accumulation, **no padding
 and no materialized `[L, L]` score matrix**.
 
-Built for [pixal3d-mac](https://github.com/lastowl/pixal3d-mac) (image-to-3D
-on Mac), but standalone — it's a drop-in for the `flash_attn` varlen API on
-any MPS workload with ragged sequences (sparse transformers, packed batches,
-windowed attention).
+Variable-length (`cu_seqlens`) attention is the core; it also does **causal
+masking, GQA/MQA, and sliding-window** attention, and ships a
+`scaled_dot_product_attention` drop-in so existing models use it unchanged.
+
+- **Two runtime paths, selected automatically**: the M5 per-core Neural
+  Accelerator (Metal 4 `matmul2d`) where available, a portable
+  `simdgroup_matrix` kernel on M1–M4. One wheel covers both.
+- **Forward only** (inference); `head_dim ≤ 128`; fp16 / bf16 / fp32.
+
+Built for [pixal3d-mac](https://github.com/lastowl/pixal3d-mac) (image-to-3D on
+Mac), but standalone: a drop-in for the `flash_attn` varlen API and for
+`F.scaled_dot_product_attention` on any MPS workload — sparse / 3D transformers,
+and LLM inference (Llama / Mistral / Qwen-class: causal + GQA + sliding-window).
 
 ## Why this exists
 
@@ -104,6 +112,8 @@ accelerated.)
 
 `head_dim <= 128`. Forward only (inference); no backward pass.
 
+Runnable tour of all of the above: [`examples/quickstart.py`](examples/quickstart.py).
+
 ## Performance
 
 Two kernel paths, selected automatically at runtime:
@@ -135,10 +145,11 @@ python -m mtlattn.bench --sizes 8192 --causal --window 256
 
 ## Correctness
 
-`python tests/test_correctness.py` — 29 cases vs a per-sequence fp32
+`python tests/test_correctness.py` — 34 cases vs a per-sequence fp32
 reference across fp16/bf16/fp32, ragged self/cross attention, packed forms,
 odd head dims, thousands of tiny windows, causal / GQA-MQA / sliding-window
-(and their combinations), and an outlier-channel overflow regression
+(and their combinations), the `sdpa()` / key-padding adapters, and an
+outlier-channel overflow regression
 (transformer activations spike to ~10²–10³; fp32 fragment accumulation is
 required — half fragments overflow to NaN).
 
