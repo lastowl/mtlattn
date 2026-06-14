@@ -1,0 +1,77 @@
+name: wheels
+
+# Build Apple-Silicon wheels. Run manually (Actions tab -> Run workflow) or on a
+# version tag. Publishing to PyPI is intentionally NOT wired up (needs a
+# PYPI_API_TOKEN secret) — wheels are uploaded as build artifacts you can
+# download or attach to a GitHub release.
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: macos-15            # Apple Silicon (arm64); real Metal + MPS GPU
+    strategy:
+      fail-fast: false
+      matrix:
+        # One wheel per (Python, torch ABI). Extend as needed — a torch C++
+        # extension is tied to the torch version it is built against.
+        python: ["3.10", "3.11", "3.12", "3.13"]
+        torch: ["2.6.*", "2.7.*"]
+    env:
+      # Broad install range; the metal4.0 MPP path is gated at runtime so a
+      # low deployment target is fine (the extension weak-links MPP).
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # The Metal compiler ships as a downloadable Xcode component. The metal4.0
+      # MPP metallib additionally needs Xcode 26 / macOS 26 — on older runners
+      # setup.py probes and skips it (simdgroup-only wheel; still correct on all
+      # Apple Silicon, M5 just falls back until the runner image has Xcode 26).
+      - name: Install Metal toolchain
+        run: sudo xcodebuild -downloadComponent MetalToolchain || true
+
+      - name: Install build deps + torch
+        run: |
+          python -m pip install -U pip setuptools wheel build
+          python -m pip install "torch==${{ matrix.torch }}"
+
+      - name: Build wheel
+        run: python -m build --wheel --no-isolation
+
+      - name: Smoke test
+        run: |
+          python -m pip install dist/*.whl
+          cd /tmp && python -c "
+          import math, torch, mtlattn
+          if torch.backends.mps.is_available():
+              M = 512
+              q = torch.randn(M, 8, 128, dtype=torch.float16, device='mps')
+              cu = torch.tensor([0, M], dtype=torch.int32, device='mps')
+              mtlattn.varlen_attention(q, q, q, cu, cu, M, 1.0 / math.sqrt(128))
+              print('smoke ok')
+          else:
+              print('no MPS on runner; build-only')
+          "
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mtlattn-py${{ matrix.python }}-torch${{ matrix.torch }}
+          path: dist/*.whl
+
+  # To publish to PyPI: add a PYPI_API_TOKEN repo secret and uncomment.
+  # publish:
+  #   needs: build
+  #   if: startsWith(github.ref, 'refs/tags/v')
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/download-artifact@v4
+  #       with: { path: dist, merge-multiple: true }
+  #     - uses: pypa/gh-action-pypi-publish@release/v1
+  #       with: { password: ${{ secrets.PYPI_API_TOKEN }}, packages-dir: dist }

@@ -36,13 +36,21 @@ kernel fixes:
 
 ## Install
 
-Requires macOS on Apple Silicon, Xcode with the Metal Toolchain
-(`xcodebuild -downloadComponent MetalToolchain`), and PyTorch with MPS.
+Requires macOS on Apple Silicon and PyTorch with MPS. Building from source also
+needs Xcode with the Metal Toolchain (`xcodebuild -downloadComponent
+MetalToolchain`); the metal4.0 MPP (M5) path additionally needs Xcode 26 /
+macOS 26.2 — without it the build falls back to the portable simdgroup kernel.
 
 ```bash
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
   pip install --no-build-isolation .
 ```
+
+Wheels bundle both metallibs (portable + MPP) and the extension weak-links the
+MPP framework, so one arm64 wheel runs on every Apple Silicon Mac — M1–M4 use
+the simdgroup path, M5 the accelerator path, selected at runtime. The
+`.github/workflows/wheels.yml` workflow builds the Python × torch wheel matrix
+(PyPI publish is left unwired — it needs a `PYPI_API_TOKEN` secret).
 
 ## Use
 

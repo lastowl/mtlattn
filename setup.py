@@ -129,17 +129,18 @@ ext = LazyMetalExtension(
     extra_link_args=[
         "-framework", "Metal",
         "-framework", "Foundation",
-        "-framework", "MetalPerformancePrimitives",
+        # Weak-link: the MPP usage lives in the metal4.0 metallib, not this
+        # .mm, so weak-linking lets the extension load on macOS < 26 (M1-M4)
+        # where this framework is absent; the MPP path stays runtime-gated.
+        "-weak_framework", "MetalPerformancePrimitives",
         "-Wl,-rpath,@loader_path",
     ],
     language="objc++",
 )
 
+# Project metadata lives in pyproject.toml; setup.py only carries the custom
+# Metal extension build (ext_modules + build_ext can't be expressed there).
 setup(
-    name="mtlattn",
-    version="0.1.0",
-    packages=["mtlattn"],
     ext_modules=[ext],
     cmdclass={"build_ext": MetalBuildExt},
-    install_requires=["torch"],
 )

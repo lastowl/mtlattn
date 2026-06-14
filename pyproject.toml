@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mtlattn"
+version = "0.1.0"
+description = "Fused variable-length flash attention (forward) for Apple Silicon / PyTorch MPS"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "lastowl" }]
+keywords = ["attention", "flash-attention", "metal", "apple-silicon", "mps", "pytorch", "m5"]
+dependencies = ["torch"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: MacOS",
+    "Environment :: GPU",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/lastowl/mtlattn"
+Repository = "https://github.com/lastowl/mtlattn"
+
+[project.scripts]
+mtlattn-bench = "mtlattn.bench:main"
+
+[tool.setuptools]
+packages = ["mtlattn"]
+include-package-data = true
+
+# The .metallib files are produced during build_ext and placed in the package
+# build dir, so they ship in the wheel; this declaration is belt-and-suspenders.
+[tool.setuptools.package-data]
+mtlattn = ["*.metallib"]
