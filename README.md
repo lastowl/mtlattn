@@ -112,6 +112,13 @@ vs padded SDPA (the usual MPS fallback): mtlattn runs windowed/ragged
 attention ~20× faster, handles 49K-token sequences in constant memory where
 SDPA needs 54 GiB, and is correct where SDPA silently corrupts (see below).
 
+Reproduce on your machine with the benchmark CLI:
+
+```bash
+python -m mtlattn.bench --paths both --vs-sdpa --causal   # MPP, simdgroup, native SDPA
+python -m mtlattn.bench --sizes 8192 --causal --window 256
+```
+
 ## Correctness
 
 `python tests/test_correctness.py` — 29 cases vs a per-sequence fp32
