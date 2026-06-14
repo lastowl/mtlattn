@@ -51,8 +51,15 @@ import mtlattn, torch
 
 # q, k, v: [total_tokens, num_heads, head_dim] bf16/fp16/fp32 on MPS.
 # cu_seqlens_*: int32 [num_seqs + 1], cumulative sequence lengths.
+# GQA/MQA: k/v may have fewer heads than q (q heads must be a multiple of
+# kv heads); each query head reads kv head (q_head // (H_q / H_kv)).
 out = mtlattn.varlen_attention(q, k, v, cu_seqlens_q, cu_seqlens_kv,
-                               max_seqlen_q, scale=None)
+                               max_seqlen_q, scale=None, causal=False)
+
+# causal=True: query i attends key j iff j <= i + (kv_len - q_len), the
+# flash_attn end-aligned convention (self-attention and cached-decode both
+# work). Fully-masked KV tiles are skipped, so causal self-attention is ~2x
+# faster than full.
 
 # flash_attn-compatible wrappers (forward only):
 out = mtlattn.flash_attn_varlen_qkvpacked_func(qkv, cu_seqlens, max_seqlen)

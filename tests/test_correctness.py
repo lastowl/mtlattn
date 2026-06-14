@@ -8,8 +8,9 @@ import torch
 import mtlattn
 
 
-def ref_varlen(q, k, v, q_lens, kv_lens, scale):
-    """Per-sequence fp32 SDPA on CPU."""
+def ref_varlen(q, k, v, q_lens, kv_lens, scale, causal=False):
+    """Per-sequence fp32 SDPA on CPU. causal: key j seen by query i iff
+    j <= i + (kv_len - q_len) (flash_attn end-aligned convention)."""
     out = torch.empty_like(q, dtype=torch.float32)
     qo = kvo = 0
     for ql, kl in zip(q_lens, kv_lens):
@@ -17,6 +18,10 @@ def ref_varlen(q, k, v, q_lens, kv_lens, scale):
         ki = k[kvo:kvo + kl].float().permute(1, 0, 2)
         vi = v[kvo:kvo + kl].float().permute(1, 0, 2)
         a = (qi @ ki.transpose(-1, -2)) * scale
+        if causal:
+            i = torch.arange(ql)[:, None]
+            j = torch.arange(kl)[None, :]
+            a = a.masked_fill(~(j <= i + (kl - ql)), float("-inf"))
         out[qo:qo + ql] = (a.softmax(-1) @ vi).permute(1, 0, 2)
         qo += ql
         kvo += kl
@@ -28,7 +33,7 @@ def cu(lens):
     return torch.cumsum(t, 0).int().to("mps")
 
 
-def run_case(name, q_lens, kv_lens, H, D, dtype, atol):
+def run_case(name, q_lens, kv_lens, H, D, dtype, atol, causal=False):
     torch.manual_seed(0)
     Mq, Mkv = sum(q_lens), sum(kv_lens)
     q = torch.randn(Mq, H, D, dtype=dtype)
@@ -36,10 +41,10 @@ def run_case(name, q_lens, kv_lens, H, D, dtype, atol):
     v = torch.randn(Mkv, H, D, dtype=dtype)
     scale = 1.0 / math.sqrt(D)
 
-    ref = ref_varlen(q, k, v, q_lens, kv_lens, scale)
+    ref = ref_varlen(q, k, v, q_lens, kv_lens, scale, causal)
     out = mtlattn.varlen_attention(
         q.to("mps"), k.to("mps"), v.to("mps"),
-        cu(q_lens), cu(kv_lens), max(q_lens), scale,
+        cu(q_lens), cu(kv_lens), max(q_lens), scale, causal=causal,
     ).cpu().float()
 
     err = (out - ref).abs().max().item()
@@ -79,6 +84,29 @@ def run_packed_case(dtype, atol):
     return ok
 
 
+def run_gqa_case(name, q_lens, kv_lens, Hq, Hkv, D, dtype, atol, causal=False):
+    """GQA/MQA: k/v have Hkv heads, Hq a multiple of Hkv. Reference expands
+    kv heads (repeat_interleave) so it reduces to the standard varlen ref."""
+    torch.manual_seed(0)
+    Mq, Mkv = sum(q_lens), sum(kv_lens)
+    g = Hq // Hkv
+    q = torch.randn(Mq, Hq, D, dtype=dtype)
+    k = torch.randn(Mkv, Hkv, D, dtype=dtype)
+    v = torch.randn(Mkv, Hkv, D, dtype=dtype)
+    scale = 1.0 / math.sqrt(D)
+
+    ref = ref_varlen(q, k.repeat_interleave(g, 1), v.repeat_interleave(g, 1),
+                     q_lens, kv_lens, scale, causal)
+    out = mtlattn.varlen_attention(
+        q.to("mps"), k.to("mps"), v.to("mps"),
+        cu(q_lens), cu(kv_lens), max(q_lens), scale, causal=causal,
+    ).cpu().float()
+    err = (out - ref).abs().max().item()
+    ok = err < atol
+    print(f"{name}: max_err={err:.2e} (atol={atol}) {'OK' if ok else 'FAIL'}")
+    return ok
+
+
 def main():
     results = []
     # dtype -> tolerance (inputs are random N(0,1); fp16/bf16 storage rounding
@@ -96,6 +124,22 @@ def main():
     results.append(run_case("5000 windows", wlens, wlens, 12, 128, torch.float16, 5e-3))
     # single long sequence
     results.append(run_case("1x16384", [16384], [16384], 12, 128, torch.float16, 5e-3))
+
+    # causal masking. D=128 exercises the MPP path, D=64 the simdgroup path;
+    # ragged batches and a cross (q_len<kv_len, cached-decode) offset included.
+    results.append(run_case("causal self D=128", [1024], [1024], 12, 128, torch.float16, 5e-3, causal=True))
+    results.append(run_case("causal self bf16", [777], [777], 8, 128, torch.bfloat16, 3e-2, causal=True))
+    results.append(run_case("causal ragged D=128", [33, 256, 1000], [33, 256, 1000], 12, 128, torch.float16, 5e-3, causal=True))
+    results.append(run_case("causal cross (cached)", [64], [320], 8, 128, torch.float16, 5e-3, causal=True))
+    results.append(run_case("causal self D=64", [200, 50], [200, 50], 16, 64, torch.float16, 5e-3, causal=True))
+
+    # GQA / MQA (grouped-query KV). D=128 -> MPP path, D=64 -> simdgroup;
+    # combined with causal and a cross (cached-decode) shape.
+    results.append(run_gqa_case("GQA 12->4 D=128", [512], [512], 12, 4, 128, torch.float16, 5e-3))
+    results.append(run_gqa_case("MQA 8->1 D=128", [33, 300], [33, 300], 8, 1, 128, torch.float16, 5e-3))
+    results.append(run_gqa_case("GQA 8->2 causal", [400], [400], 8, 2, 128, torch.float16, 5e-3, causal=True))
+    results.append(run_gqa_case("MQA cross cached", [16], [512], 8, 1, 128, torch.float16, 5e-3, causal=True))
+    results.append(run_gqa_case("GQA 8->2 D=64", [200, 50], [200, 50], 8, 2, 64, torch.float16, 5e-3))
     # outlier channels (real transformer activations spike to 1e2-1e3; QK
     # partial sums must not overflow — caught a NaN bug in half fragments)
     torch.manual_seed(3)

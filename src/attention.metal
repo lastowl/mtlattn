@@ -27,6 +27,8 @@ struct Params {
     uint k_row_stride;
     uint v_row_stride;
     uint o_row_stride;
+    uint causal;        // 0 = full attention; 1 = causal mask
+    uint gqa_group;     // query heads per kv head (1 = standard MHA)
 };
 
 constant constexpr uint DMAX = 128;
@@ -62,7 +64,8 @@ void varlen_attn_impl(
     constexpr uint TGS = 32 * SGS;
 
     const uint seq = tgid.y;
-    const uint head = tgid.z;
+    const uint head = tgid.z;                       // query head
+    const uint kv_head = head / p.gqa_group;        // GQA: query head -> kv head
     const uint D = p.head_dim;
     const uint dblks = (D + 7) / 8;
 
@@ -74,6 +77,9 @@ void varlen_attn_impl(
     const int q0 = q_start + int(tgid.x * BQ);
     if (q0 >= q_end) return;
     const int q_rows = min(int(BQ), q_end - q0);
+    // Causal (flash_attn convention): query i attends key j iff j <= i + coff.
+    const int coff = kv_len - (q_end - q_start);
+    const int q_hi = (q0 - q_start) + (q_rows - 1) + coff;  // furthest key this block sees
 
     // Fold the softmax scale into Q at staging time: scores then live near
     // +-1, where half fragments have far better absolute precision than at
@@ -99,6 +105,7 @@ void varlen_attn_impl(
     const uint sg_row0 = sgid * 8;          // block-local first row of this sg
 
     for (int t0 = 0; t0 < kv_len; t0 += int(BK)) {
+        if (p.causal && t0 > q_hi) break;   // tile fully beyond causal horizon
         const int tk = min(int(BK), kv_len - t0);
 
         for (uint idx = tid; idx < BK * D; idx += TGS) {
@@ -106,8 +113,8 @@ void varlen_attn_impl(
             const uint d = idx % D;
             if (int(kk) < tk) {
                 const ulong krow = ulong(kv_start + t0 + int(kk));
-                KsT[d * BK + kk] = T_f(K[krow * p.k_row_stride + head * D + d]);
-                Vs[kk * D + d] = T_f(V[krow * p.v_row_stride + head * D + d]);
+                KsT[d * BK + kk] = T_f(K[krow * p.k_row_stride + kv_head * D + d]);
+                Vs[kk * D + d] = T_f(V[krow * p.v_row_stride + kv_head * D + d]);
             } else {
                 KsT[d * BK + kk] = T_f(0.0f);
                 Vs[kk * D + d] = T_f(0.0f);
@@ -143,16 +150,18 @@ void varlen_attn_impl(
         // Online softmax, one thread per row.
         if (tid < BQ) {
             const uint r = tid;
+            int lim = tk;
+            if (p.causal) { int h = (q0 - q_start) + int(r) + coff - t0 + 1; lim = clamp(h, 0, tk); }
             const float m_old = m_run[r];
             float row_max = m_old;
-            for (int kk = 0; kk < tk; ++kk) {
+            for (int kk = 0; kk < lim; ++kk) {
                 row_max = max(row_max, Ss[r * BK + uint(kk)]);  // scale folded into Q
             }
             const float c = exp(m_old - row_max);
             float row_sum = 0.0f;
             for (uint kk = 0; kk < BK; ++kk) {
                 float w = 0.0f;
-                if (int(kk) < tk) {
+                if (int(kk) < lim) {
                     w = exp(Ss[r * BK + kk] - row_max);
                     row_sum += w;
                 }
