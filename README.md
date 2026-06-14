@@ -63,17 +63,23 @@ out = mtlattn.flash_attn_varlen_kvpacked_func(q, kv, cu_q, cu_k, max_q, max_k)
 
 ## Performance
 
-M5 Pro, bf16, 12 heads, head_dim 128:
+Two kernel paths, selected automatically at runtime:
+- **MPP path** (default on M5 + macOS 26.2+): fused varlen attention through
+  Metal 4 Metal Performance Primitives `matmul2d`, targeting the M5 per-core
+  **Neural Accelerator** (fp16/bf16 operands, fp32 accumulate).
+- **simdgroup path** (portable, M1+): the fallback used on older GPUs, older
+  macOS, non-128 head dims, or when `MTLATTN_NO_MPP=1`.
 
-| Workload | padded SDPA | mtlattn | speedup |
-|---|---|---|---|
-| windowed (2000 windows ≤512 tok) | 50.5 s | 2.5 s | **20×** |
-| full attention, 49K tokens | OOM (54 GiB) | constant memory | runs at all |
-| full attention, < ~19K tokens | faster | slower (~2.5×) | use SDPA below threshold |
+M5 Pro, bf16, 12 heads, head_dim 128, through the API:
 
-So the intended use is **hybrid**: SDPA for small sequences where it's both
-fast and correct, mtlattn for large/ragged ones where SDPA is slow, OOMs, or
-silently corrupts.
+| Path | TFLOPS | vs simdgroup |
+|---|---|---|
+| simdgroup | ~0.5 | 1× |
+| **MPP (M5 accelerator)** | **~5.0** | **~10×** |
+
+vs padded SDPA (the usual MPS fallback): mtlattn runs windowed/ragged
+attention ~20× faster, handles 49K-token sequences in constant memory where
+SDPA needs 54 GiB, and is correct where SDPA silently corrupts (see below).
 
 ## Correctness
 
