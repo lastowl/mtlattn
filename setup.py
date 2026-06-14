@@ -49,18 +49,36 @@ class MetalBuildExt(build_ext):
         subprocess.check_call(["xcrun", "-sdk", "macosx", "metallib"] + air_files + ["-o", metallib])
 
         # Optional Metal-4 MPP kernel (M5 Neural Accelerator, macOS 26.2+ at
-        # runtime). Best-effort: skip if this toolchain can't build metal4.0.
+        # runtime). Skipped only if this *toolchain* can't target metal4.0 at
+        # all; a real compile error in attn_mpp.metal is fatal, not swallowed
+        # (a silent skip here would leave a stale/missing metallib and quietly
+        # fall back to the slow path or run an old kernel).
         mpp_metallib = None
         mpp_src = os.path.join(SRC_DIR, "attn_mpp.metal")
         if os.path.exists(mpp_src):
-            try:
+            # Probe whether metal4.0 is supported by this toolchain at all.
+            probe = os.path.join(build_temp, "_mpp_probe.metal")
+            with open(probe, "w") as f:
+                f.write("#include <metal_stdlib>\nkernel void _p() {}\n")
+            probe_air = os.path.join(build_temp, "_mpp_probe.air")
+            metal4_ok = subprocess.run(
+                ["xcrun", "-sdk", "macosx", "metal", "-c", probe, "-o", probe_air, "-std=metal4.0"],
+                capture_output=True, text=True).returncode == 0
+            if not metal4_ok:
+                print("  mtlattn: toolchain can't target metal4.0; M5 MPP fast-path disabled")
+            else:
+                # metal4.0 works -> attn_mpp.metal MUST compile. Surface errors.
                 mpp_air = os.path.join(build_temp, "attn_mpp.air")
-                subprocess.check_call(["xcrun", "-sdk", "macosx", "metal", "-c", mpp_src, "-o", mpp_air, "-std=metal4.0", "-O3"])
+                r = subprocess.run(
+                    ["xcrun", "-sdk", "macosx", "metal", "-c", mpp_src, "-o", mpp_air, "-std=metal4.0", "-O3"],
+                    capture_output=True, text=True)
+                if r.returncode != 0:
+                    raise RuntimeError(
+                        "mtlattn: attn_mpp.metal failed to compile under metal4.0 "
+                        "(M5 MPP path). Fix the kernel; do not ship a stale metallib.\n"
+                        + r.stderr)
                 mpp_metallib = os.path.join(build_temp, "mtlattn_mpp.metallib")
                 subprocess.check_call(["xcrun", "-sdk", "macosx", "metallib", mpp_air, "-o", mpp_metallib])
-            except subprocess.CalledProcessError:
-                print("  mtlattn: metal4.0 MPP kernel not buildable on this toolchain; M5 fast-path disabled")
-                mpp_metallib = None
 
         for ext in self.extensions:
             if hasattr(ext, "_resolve_torch"):
@@ -71,8 +89,11 @@ class MetalBuildExt(build_ext):
             ext_dir = os.path.dirname(self.get_ext_fullpath(ext.name))
             os.makedirs(ext_dir, exist_ok=True)
             shutil.copy2(metallib, os.path.join(ext_dir, "mtlattn.metallib"))
+            mpp_dst = os.path.join(ext_dir, "mtlattn_mpp.metallib")
             if mpp_metallib:
-                shutil.copy2(mpp_metallib, os.path.join(ext_dir, "mtlattn_mpp.metallib"))
+                shutil.copy2(mpp_metallib, mpp_dst)
+            elif os.path.exists(mpp_dst):
+                os.remove(mpp_dst)  # don't leave a stale MPP kernel behind
 
 
 class LazyMetalExtension(Extension):
