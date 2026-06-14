@@ -138,38 +138,42 @@ void varlen_attn_impl(
                 }
             }
             for (uint kb = 0; kb < BK / 8; ++kb) {
-                simdgroup_store(Sfrag[kb], &Ps[sg_row0 * BK + kb * 8], BK);
+                // T_f == float for every instantiation, so store scores straight
+                // to the fp32 Ss buffer (saves a Ps->Ss copy and a barrier).
+                simdgroup_store(Sfrag[kb], &Ss[sg_row0 * BK + kb * 8], BK);
             }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint idx = tid; idx < BQ * BK; idx += TGS) {
-            Ss[idx] = float(Ps[idx]);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Online softmax, one thread per row.
-        if (tid < BQ) {
-            const uint r = tid;
+        // Online softmax — all lanes active: 4 lanes cooperate per row (8 rows
+        // per simdgroup), each scanning a strided quarter of the keys, reduced
+        // with simd shuffles. (scale was folded into Q at staging.)
+        {
+            const uint row_in_sg = lane >> 2;        // 0..7 within this simdgroup
+            const uint sub = lane & 3u;              // 0..3: which key-quarter
+            const uint r = sg_row0 + row_in_sg;
             int lim = tk;
             if (p.causal) { int h = (q0 - q_start) + int(r) + coff - t0 + 1; lim = clamp(h, 0, tk); }
             const float m_old = m_run[r];
-            float row_max = m_old;
-            for (int kk = 0; kk < lim; ++kk) {
-                row_max = max(row_max, Ss[r * BK + uint(kk)]);  // scale folded into Q
-            }
+            float lmax = m_old;
+            for (int kk = int(sub); kk < lim; kk += 4) lmax = max(lmax, Ss[r * BK + uint(kk)]);
+            lmax = max(lmax, simd_shuffle_xor(lmax, 1u));
+            lmax = max(lmax, simd_shuffle_xor(lmax, 2u));
+            const float row_max = lmax;
             const float c = exp(m_old - row_max);
-            float row_sum = 0.0f;
-            for (uint kk = 0; kk < BK; ++kk) {
-                float w = 0.0f;
-                if (int(kk) < lim) {
-                    w = exp(Ss[r * BK + kk] - row_max);
-                    row_sum += w;
-                }
+            float lsum = 0.0f;
+            for (uint kk = sub; kk < BK; kk += 4) {
+                float w = (int(kk) < lim) ? exp(Ss[r * BK + kk] - row_max) : 0.0f;
+                lsum += w;
                 Ps[r * BK + kk] = T_f(w);
             }
-            m_run[r] = row_max;
-            l_run[r] = l_run[r] * c + row_sum;
-            c_run[r] = c;
+            lsum += simd_shuffle_xor(lsum, 1u);
+            lsum += simd_shuffle_xor(lsum, 2u);
+            if (sub == 0u) {
+                m_run[r] = row_max;
+                l_run[r] = l_run[r] * c + lsum;
+                c_run[r] = c;
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -278,6 +282,10 @@ void varlen_attn_impl(
 // poisoning the softmax with inf-inf = NaN. bf16's 8-bit exponent makes its
 // inputs immune to overflow, but any half-precision accumulation of them
 // is not. Speed lives in tiling, not fragment width.
-INSTANTIATE(varlen_attn_half, half, float, 2, 16, false)
-INSTANTIATE(varlen_attn_bfloat, bfloat, float, 2, 16, false)
-INSTANTIATE(varlen_attn_float, float, float, 2, 16, true)
+// 4 simdgroups (BQ=32, 128 threads) with BK=8 keys/tile: 4 resident
+// simdgroups hide device-load latency far better than 2, and the small BK
+// keeps threadgroup memory (~27 KB) under the 32 KB cap that affords them.
+// ~1.5x the old 2-simdgroup/BK=16 tiling on the portable path.
+INSTANTIATE(varlen_attn_half, half, float, 4, 8, false)
+INSTANTIATE(varlen_attn_bfloat, bfloat, float, 4, 8, false)
+INSTANTIATE(varlen_attn_float, float, float, 4, 8, true)

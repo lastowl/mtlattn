@@ -75,13 +75,15 @@ Two kernel paths, selected automatically at runtime:
   Metal 4 Metal Performance Primitives `matmul2d`, targeting the M5 per-core
   **Neural Accelerator** (fp16/bf16 operands, fp32 accumulate).
 - **simdgroup path** (portable, M1+): the fallback used on older GPUs, older
-  macOS, non-128 head dims, or when `MTLATTN_NO_MPP=1`.
+  macOS, non-128 head dims, or when `MTLATTN_NO_MPP=1`. Tiled at 4 simdgroups
+  / BK=8 so 4 resident simdgroups hide device-load latency (~1.5× a naive
+  2-simdgroup tiling).
 
 M5 Pro, bf16, 12 heads, head_dim 128, through the API:
 
-| Path | TFLOPS | vs simdgroup |
+| Path | TFLOPS | vs naive simdgroup |
 |---|---|---|
-| simdgroup | ~0.5 | 1× |
+| simdgroup (tiled) | ~0.8 | 1.5× |
 | **MPP (M5 accelerator)** | **~5.0** | **~10×** |
 
 vs padded SDPA (the usual MPS fallback): mtlattn runs windowed/ragged

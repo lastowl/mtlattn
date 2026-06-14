@@ -1,10 +1,16 @@
 # Shelved kernel experiments
 
 Correct, measured, but **not** in the production kernels — kept here to re-apply
-when the kernel is tuned for compute-bound configs (older Apple GPUs, fewer
-heads). On M5 Pro they are null because the kernels are **memory-bandwidth
-bound** on K/V re-reads (~310 GB/s, the DRAM ceiling), so compute-side wins are
-invisible. All variants below pass `tests/test_correctness.py` (14 cases).
+when a config is compute-bound rather than bandwidth-bound. On the M5 *MPP*
+path they are null because it is **memory-bandwidth bound** on K/V re-reads
+(~310 GB/s, the DRAM ceiling), so compute-side wins are invisible.
+
+Note: the *simdgroup-path* versions of these ideas **did** ship — the parallel
+softmax (§2 below) and the 4-simdgroup/BK=8 tiling are now the default
+`attention.metal` kernel (Track A, ~1.5x on the portable path; the simdgroup
+path is latency-bound, not bandwidth-bound, so occupancy wins there). What
+remains shelved is only the **MPP-path** variants (§1, §3), which are null
+because that path is bandwidth-bound.
 
 Re-validate with the correctness suite and a per-config benchmark before
 shipping any of these — the right tile/parallelism depends on the target GPU.

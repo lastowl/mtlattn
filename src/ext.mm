@@ -166,9 +166,9 @@ struct KernelCfg {
 
 KernelCfg kernel_for_dtype(at::ScalarType t) {
     switch (t) {
-        case at::kHalf: return {"varlen_attn_half", 16, 64};
-        case at::kBFloat16: return {"varlen_attn_bfloat", 16, 64};
-        case at::kFloat: return {"varlen_attn_float", 16, 64};
+        case at::kHalf: return {"varlen_attn_half", 32, 128};
+        case at::kBFloat16: return {"varlen_attn_bfloat", 32, 128};
+        case at::kFloat: return {"varlen_attn_float", 32, 128};
         default: TORCH_CHECK(false, "mtlattn: unsupported dtype ", t);
     }
 }
