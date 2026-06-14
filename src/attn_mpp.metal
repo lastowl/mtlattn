@@ -164,6 +164,7 @@ kernel void attn_mpp_flash(
 template <typename T, int TM, int TN, int D, int SG>
 inline void attn_vl(device const T* Q, device const T* K, device const T* V, device T* O,
                     device const int* cu_q, device const int* cu_kv, uint H, float scale,
+                    uint q_rs, uint k_rs, uint v_rs,
                     threadgroup float* Sb, threadgroup T* Pb, threadgroup float* PVb,
                     threadgroup float* Ob, threadgroup float* mb, threadgroup float* lb, threadgroup float* cb,
                     uint tid, uint qtile, uint seq, uint head)
@@ -172,15 +173,17 @@ inline void attn_vl(device const T* Q, device const T* K, device const T* V, dev
     using TGSf = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>;
     using TGSh = tensor<threadgroup T,  dextents<int32_t, 2>, tensor_inline>;
     constexpr uint NT = SG * 32;
-    const int rs = int(H * D);                       // row stride (tokens)
+    const int qrs = int(q_rs), krs = int(k_rs), vrs = int(v_rs);  // input row strides
+    const int ho = int(head * D);                    // head offset (stride(1)==D guaranteed)
+    const int o_rs = int(H * D);                     // output is contiguous [M,H,D]
     const int q_start = cu_q[seq],  q_end = cu_q[seq + 1];
     const int kv_start = cu_kv[seq], kv_end = cu_kv[seq + 1];
     const int q0 = q_start + int(qtile) * TM;
     if (q0 >= q_end) return;
     const int q_cnt = min(TM, q_end - q0);
-    thread array<int32_t, 2> st = {1, rs};
+    thread array<int32_t, 2> stq = {1, qrs}, stk = {1, krs}, stv = {1, vrs};
 
-    HT tQ((device T*)Q + ulong(q0) * rs + head * D, dextents<int32_t, 2>(D, q_cnt), st);
+    HT tQ((device T*)Q + ulong(q0) * qrs + ho, dextents<int32_t, 2>(D, q_cnt), stq);
     TGSf tS(Sb, dextents<int32_t, 2>(TN, TM));
     TGSh tP(Pb, dextents<int32_t, 2>(TN, TM));
     TGSf tPV(PVb, dextents<int32_t, 2>(D, TM));
@@ -191,8 +194,8 @@ inline void attn_vl(device const T* Q, device const T* K, device const T* V, dev
 
     for (int kv = kv_start; kv < kv_end; kv += TN) {
         int tk = min(TN, kv_end - kv);
-        HT tK((device T*)K + ulong(kv) * rs + head * D, dextents<int32_t, 2>(D, tk), st);
-        HT tV((device T*)V + ulong(kv) * rs + head * D, dextents<int32_t, 2>(D, tk), st);
+        HT tK((device T*)K + ulong(kv) * krs + ho, dextents<int32_t, 2>(D, tk), stk);
+        HT tV((device T*)V + ulong(kv) * vrs + ho, dextents<int32_t, 2>(D, tk), stv);
         { constexpr auto d = matmul2d_descriptor(TM, TN, static_cast<int>(dynamic_extent), false, true, false);
           matmul2d<d, execution_simdgroups<SG>> op;
           auto a = tQ.slice(0, 0); auto b = tK.slice(0, 0); auto c = tS.slice(0, 0); op.run(a, b, c); }
@@ -215,7 +218,7 @@ inline void attn_vl(device const T* Q, device const T* K, device const T* V, dev
     for (uint r = tid; r < TM; r += NT) {
         if (int(r) >= q_cnt) continue;
         float inv = (lb[r] > 0.0f) ? 1.0f/lb[r] : 0.0f;
-        ulong base = ulong(q0 + int(r)) * rs + head * D;
+        ulong base = ulong(q0 + int(r)) * o_rs + head * D;
         for (uint dd = 0; dd < D; ++dd) O[base + dd] = T(Ob[r*D+dd]*inv);
     }
 }
@@ -224,24 +227,26 @@ kernel void attn_mpp_varlen_half(
     device const half* Q [[buffer(0)]], device const half* K [[buffer(1)]], device const half* V [[buffer(2)]],
     device half* O [[buffer(3)]], device const int* cu_q [[buffer(4)]], device const int* cu_kv [[buffer(5)]],
     constant uint& H [[buffer(6)]], constant float& scale [[buffer(7)]],
+    constant uint& q_rs [[buffer(8)]], constant uint& k_rs [[buffer(9)]], constant uint& v_rs [[buffer(10)]],
     uint tid [[thread_index_in_threadgroup]], uint3 tgid [[threadgroup_position_in_grid]])
 {
     constexpr int TM=16,TN=64,D=128,SG=4;
     threadgroup float Sb[TM*TN]; threadgroup half Pb[TM*TN];
     threadgroup float PVb[TM*D]; threadgroup float Ob[TM*D];
     threadgroup float mb[TM], lb[TM], cb[TM];
-    attn_vl<half,TM,TN,D,SG>(Q,K,V,O,cu_q,cu_kv,H,scale,Sb,Pb,PVb,Ob,mb,lb,cb,tid,tgid.x,tgid.y,tgid.z);
+    attn_vl<half,TM,TN,D,SG>(Q,K,V,O,cu_q,cu_kv,H,scale,q_rs,k_rs,v_rs,Sb,Pb,PVb,Ob,mb,lb,cb,tid,tgid.x,tgid.y,tgid.z);
 }
 
 kernel void attn_mpp_varlen_bfloat(
     device const bfloat* Q [[buffer(0)]], device const bfloat* K [[buffer(1)]], device const bfloat* V [[buffer(2)]],
     device bfloat* O [[buffer(3)]], device const int* cu_q [[buffer(4)]], device const int* cu_kv [[buffer(5)]],
     constant uint& H [[buffer(6)]], constant float& scale [[buffer(7)]],
+    constant uint& q_rs [[buffer(8)]], constant uint& k_rs [[buffer(9)]], constant uint& v_rs [[buffer(10)]],
     uint tid [[thread_index_in_threadgroup]], uint3 tgid [[threadgroup_position_in_grid]])
 {
     constexpr int TM=16,TN=64,D=128,SG=4;
     threadgroup float Sb[TM*TN]; threadgroup bfloat Pb[TM*TN];
     threadgroup float PVb[TM*D]; threadgroup float Ob[TM*D];
     threadgroup float mb[TM], lb[TM], cb[TM];
-    attn_vl<bfloat,TM,TN,D,SG>(Q,K,V,O,cu_q,cu_kv,H,scale,Sb,Pb,PVb,Ob,mb,lb,cb,tid,tgid.x,tgid.y,tgid.z);
+    attn_vl<bfloat,TM,TN,D,SG>(Q,K,V,O,cu_q,cu_kv,H,scale,q_rs,k_rs,v_rs,Sb,Pb,PVb,Ob,mb,lb,cb,tid,tgid.x,tgid.y,tgid.z);
 }

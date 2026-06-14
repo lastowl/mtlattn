@@ -111,13 +111,22 @@ static bool try_mpp_varlen(const at::Tensor& q, const at::Tensor& k, const at::T
     if (D != 128) return false;
     auto st = q.scalar_type();
     if (st != at::kHalf && st != at::kBFloat16) return false;
+    // MPP wins on large sequences; small windows are faster on the simdgroup
+    // path. Gate on max_seqlen_q (override with MTLATTN_MPP_MIN).
+    int64_t min_seq = 1024;
+    if (const char* e = std::getenv("MTLATTN_MPP_MIN")) min_seq = atoll(e);
+    if (max_seqlen_q < min_seq) return false;
+    // Kernel assumes head stride == D (last dim contiguous, heads packed);
+    // row stride is passed per-tensor so strided unbind views need no copy.
+    if (q.stride(1) != D || k.stride(1) != D || v.stride(1) != D) return false;
+    if (q.stride(2) != 1 || k.stride(2) != 1 || v.stride(2) != 1) return false;
     auto& ctx = Context::instance();
     auto pso = ctx.mpp_pipeline(st == at::kHalf ? "attn_mpp_varlen_half" : "attn_mpp_varlen_bfloat");
     if (pso == nil) return false;
-    if (q.stride(1) != D || k.stride(1) != D || v.stride(1) != D) return false;  // contiguous-head only
 
     const int64_t B = cu_q.numel() - 1;
     uint32_t Hh = (uint32_t)H; float sc = (float)scale;
+    uint32_t qrs=(uint32_t)q.stride(0), krs=(uint32_t)k.stride(0), vrs=(uint32_t)v.stride(0);
     uint32_t qtiles = ((uint32_t)max_seqlen_q + 15) / 16;
     id<MTLBuffer> qb=at::native::mps::getMTLBufferStorage(q), kb=at::native::mps::getMTLBufferStorage(k),
                   vb=at::native::mps::getMTLBufferStorage(v), ob=at::native::mps::getMTLBufferStorage(out),
@@ -136,6 +145,7 @@ static bool try_mpp_varlen(const at::Tensor& q, const at::Tensor& k, const at::T
             [enc setBuffer:qb offset:qo atIndex:0]; [enc setBuffer:kb offset:ko atIndex:1]; [enc setBuffer:vb offset:vo atIndex:2];
             [enc setBuffer:ob offset:oo atIndex:3]; [enc setBuffer:cqb offset:cqo atIndex:4]; [enc setBuffer:ckb offset:cko atIndex:5];
             [enc setBytes:&Hh length:4 atIndex:6]; [enc setBytes:&sc length:4 atIndex:7];
+            [enc setBytes:&qrs length:4 atIndex:8]; [enc setBytes:&krs length:4 atIndex:9]; [enc setBytes:&vrs length:4 atIndex:10];
             [enc dispatchThreadgroups:tg threadsPerThreadgroup:tpt];
             [enc endEncoding];
         }
@@ -201,8 +211,7 @@ at::Tensor varlen_attention(
     // Metal-4 MPP fast-path (M5 Neural Accelerator). Falls through on any
     // machine/shape it can't handle, to the portable simdgroup kernel below.
     if (q.size(0) > 0 && !std::getenv("MTLATTN_NO_MPP")) {
-        auto qc = q.contiguous(), kc = k.contiguous(), vc = v.contiguous();
-        if (try_mpp_varlen(qc, kc, vc, out, cu_q, cu_kv, H, D, max_seqlen_q, scale))
+        if (try_mpp_varlen(q, k, v, out, cu_q, cu_kv, H, D, max_seqlen_q, scale))
             return out;
     }
 
