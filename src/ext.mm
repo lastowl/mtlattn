@@ -10,6 +10,7 @@
 #import <ATen/mps/MPSStream.h>
 #include <torch/extension.h>
 #include <dlfcn.h>
+#include <exception>
 #include <string>
 #include <unordered_map>
 
@@ -25,6 +26,19 @@ constexpr uint32_t SG_PER_TG = 4;
 constexpr uint32_t TG_SIZE = SG_PER_TG * 32;
 constexpr uint32_t TILE_K = 16;
 constexpr uint32_t HEAD_DIM_MAX = 128;
+
+// Portable stand-in for at::mps::dispatch_sync_with_rethrow, which is a
+// torch-internal symbol present only in some torch versions: run the block on
+// the MPS stream's serial queue synchronously and rethrow any C++ exception
+// (e.g. TORCH_CHECK) it raised. Keeps the extension buildable against any torch
+// with MPS, not just the version that happens to export that helper.
+static inline void mps_dispatch_sync(dispatch_queue_t q, void (^block)(void)) {
+    __block std::exception_ptr eptr;
+    dispatch_sync(q, ^() {
+        try { block(); } catch (...) { eptr = std::current_exception(); }
+    });
+    if (eptr) std::rethrow_exception(eptr);
+}
 
 struct Params {
     uint32_t num_heads;
@@ -141,7 +155,7 @@ static bool try_mpp_varlen(const at::Tensor& q, const at::Tensor& k, const at::T
     auto* stream = at::mps::getCurrentMPSStream();
     MTLSize tg = MTLSizeMake(qtiles, (NSUInteger)B, (NSUInteger)H);
     MTLSize tpt = MTLSizeMake(pso.threadExecutionWidth * 4, 1, 1);
-    at::mps::dispatch_sync_with_rethrow(stream->queue(), ^() {
+    mps_dispatch_sync(stream->queue(), ^() {
         @autoreleasepool {
             stream->endKernelCoalescing();
             id<MTLComputeCommandEncoder> enc = [stream->commandBuffer() computeCommandEncoder];
@@ -263,7 +277,7 @@ at::Tensor varlen_attention(
     const NSUInteger ck_off = cu_kv.storage_offset() * cu_kv.element_size();
 
     auto* stream = at::mps::getCurrentMPSStream();
-    at::mps::dispatch_sync_with_rethrow(stream->queue(), ^() {
+    mps_dispatch_sync(stream->queue(), ^() {
         @autoreleasepool {
             stream->endKernelCoalescing();
             id<MTLCommandBuffer> cmdbuf = stream->commandBuffer();
