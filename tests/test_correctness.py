@@ -1,6 +1,7 @@
 """Exactness tests: mtlattn vs per-sequence fp32 SDPA reference."""
 
 import math
+import os
 import sys
 
 import torch
@@ -203,14 +204,20 @@ def main():
     results.append(run_case("SWA non-causal band", [256], [256], 8, 128, torch.float16, 5e-3, causal=False, window=48))
     results.append(run_case("SWA D=64", [300, 40], [300, 40], 16, 64, torch.float16, 5e-3, causal=True, window=80))
 
-    # Dense scaled_dot_product_attention adapter (mtlattn.sdpa): MHA, GQA, causal.
-    results.append(run_sdpa_case("sdpa MHA B2", 2, 8, 8, 1024, 128, torch.float16, 5e-3))
-    results.append(run_sdpa_case("sdpa GQA B1", 1, 8, 2, 2048, 128, torch.float16, 5e-3))
-    results.append(run_sdpa_case("sdpa causal", 2, 12, 12, 512, 128, torch.float16, 5e-3, causal=True))
-
-    # replace_sdpa key-padding mask -> varlen conversion (full and causal).
-    results.append(run_padding_case("pad mask", 4, 8, 1024, 128, [1024, 800, 500, 1024], torch.float16, 5e-3))
-    results.append(run_padding_case("pad mask causal", 3, 12, 1024, 128, [1024, 700, 400], torch.float16, 5e-3, causal=True))
+    # The SDPA adapter cases go through torch's own MPS ops (permute/contiguous
+    # -> a runtime-compiled transpose shader). Set MTLATTN_SKIP_SDPA to skip them
+    # where torch can't JIT-compile MPS shaders (e.g. headless CI runners, which
+    # still run our pre-compiled metallibs fine — the kernel cases above pass).
+    if os.environ.get("MTLATTN_SKIP_SDPA"):
+        print("(skipping sdpa/padding adapter cases — MTLATTN_SKIP_SDPA set)")
+    else:
+        # Dense scaled_dot_product_attention adapter (mtlattn.sdpa): MHA, GQA, causal.
+        results.append(run_sdpa_case("sdpa MHA B2", 2, 8, 8, 1024, 128, torch.float16, 5e-3))
+        results.append(run_sdpa_case("sdpa GQA B1", 1, 8, 2, 2048, 128, torch.float16, 5e-3))
+        results.append(run_sdpa_case("sdpa causal", 2, 12, 12, 512, 128, torch.float16, 5e-3, causal=True))
+        # replace_sdpa key-padding mask -> varlen conversion (full and causal).
+        results.append(run_padding_case("pad mask", 4, 8, 1024, 128, [1024, 800, 500, 1024], torch.float16, 5e-3))
+        results.append(run_padding_case("pad mask causal", 3, 12, 1024, 128, [1024, 700, 400], torch.float16, 5e-3, causal=True))
     # outlier channels (real transformer activations spike to 1e2-1e3; QK
     # partial sums must not overflow — caught a NaN bug in half fragments)
     torch.manual_seed(3)
