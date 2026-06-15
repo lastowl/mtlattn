@@ -16,10 +16,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # One wheel per (Python, torch ABI). Extend as needed — a torch C++
-        # extension is tied to the torch version it is built against.
-        python: ["3.10", "3.11", "3.12", "3.13"]
-        torch: ["2.6.*", "2.7.*"]
+        # One wheel per (Python, torch ABI). A torch C++ extension is tied to the
+        # torch version it is built against. Pinned to torch that runs on the
+        # macos-26 build/test image — torch <= 2.7 (early 2025) predates macOS 26
+        # and its own MPS backend fails to JIT-compile there. Widen as newer torch
+        # releases land (each addition needs a green run on this image).
+        python: ["3.11", "3.12", "3.13"]
+        torch: ["2.12.*"]
     env:
       # Broad install range; the metal4.0 MPP path is gated at runtime so a
       # low deployment target is fine (the extension weak-links MPP).
