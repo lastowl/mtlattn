@@ -58,7 +58,7 @@ Wheels bundle both metallibs (portable + MPP) and the extension weak-links the
 MPP framework, so one arm64 wheel runs on every Apple Silicon Mac — M1–M4 use
 the simdgroup path, M5 the accelerator path, selected at runtime. The
 `.github/workflows/wheels.yml` workflow builds the Python × torch wheel matrix
-(PyPI publish is left unwired — it needs a `PYPI_API_TOKEN` secret).
+and publishes to PyPI via Trusted Publishing (OIDC) on a `v*` tag.
 
 ## Use
 

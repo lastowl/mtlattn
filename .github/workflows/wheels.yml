@@ -65,13 +65,20 @@ jobs:
           name: mtlattn-py${{ matrix.python }}-torch${{ matrix.torch }}
           path: dist/*.whl
 
-  # To publish to PyPI: add a PYPI_API_TOKEN repo secret and uncomment.
-  # publish:
-  #   needs: build
-  #   if: startsWith(github.ref, 'refs/tags/v')
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - uses: actions/download-artifact@v4
-  #       with: { path: dist, merge-multiple: true }
-  #     - uses: pypa/gh-action-pypi-publish@release/v1
-  #       with: { password: ${{ secrets.PYPI_API_TOKEN }}, packages-dir: dist }
+  # Publish to PyPI via Trusted Publishing (OIDC) on a v* tag. No token: PyPI
+  # is configured with this repo + workflow (wheels.yml) + environment "pypi".
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write          # mint the short-lived OIDC token
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true   # collect every matrix wheel into dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
