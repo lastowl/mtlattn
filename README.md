@@ -44,21 +44,28 @@ kernel fixes:
 
 ## Install
 
-Requires macOS on Apple Silicon and PyTorch with MPS. Building from source also
-needs Xcode with the Metal Toolchain (`xcodebuild -downloadComponent
-MetalToolchain`); the metal4.0 MPP (M5) path additionally needs Xcode 26 /
-macOS 26.2 — without it the build falls back to the portable simdgroup kernel.
+```bash
+pip install mtlattn
+```
+
+Requires macOS on Apple Silicon and PyTorch with MPS. The published wheels are
+built against **torch 2.12** for **Python 3.11–3.13** (a torch C++ extension is
+tied to the torch version it was built against). One arm64 wheel covers every
+Apple Silicon Mac — M1–M4 use the simdgroup path, M5 the accelerator path,
+selected at runtime; both metallibs are bundled and the MPP framework is
+weak-linked, so it loads on macOS 13+.
+
+On other torch versions, build from source:
 
 ```bash
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
   pip install --no-build-isolation .
 ```
 
-Wheels bundle both metallibs (portable + MPP) and the extension weak-links the
-MPP framework, so one arm64 wheel runs on every Apple Silicon Mac — M1–M4 use
-the simdgroup path, M5 the accelerator path, selected at runtime. The
-`.github/workflows/wheels.yml` workflow builds the Python × torch wheel matrix
-and publishes to PyPI via Trusted Publishing (OIDC) on a `v*` tag.
+Building from source needs Xcode with the Metal Toolchain (`xcodebuild
+-downloadComponent MetalToolchain`); the metal4.0 MPP (M5) path additionally
+needs Xcode 26 / macOS 26.2, else the build falls back to the portable
+simdgroup kernel.
 
 ## Use
 
@@ -113,6 +120,41 @@ accelerated.)
 `head_dim <= 128`. Forward only (inference); no backward pass.
 
 Runnable tour of all of the above: [`examples/quickstart.py`](examples/quickstart.py).
+
+## Using it in your project
+
+**Existing PyTorch / Hugging Face model — no code changes.** Route attention
+through mtlattn for the large forward passes it wins on; everything else falls
+back to native SDPA:
+
+```python
+import mtlattn
+mtlattn.replace_sdpa()        # patch F.scaled_dot_product_attention (inference)
+# ... load and run your model on device="mps" as usual ...
+```
+
+**Already using `flash_attn`.** The varlen entry points are signature-compatible
+(forward only), so it's an import swap:
+
+```python
+# from flash_attn import flash_attn_varlen_qkvpacked_func
+from mtlattn import flash_attn_varlen_qkvpacked_func
+```
+
+**Custom transformer / new code.** Call the kernel directly with the flags you
+need — ragged batches, causal, GQA, sliding window all compose:
+
+```python
+out = mtlattn.varlen_attention(q, k, v, cu_q, cu_kv, max_seqlen_q,
+                               causal=True, window=4096)
+```
+
+**Sparse / 3D transformers (TRELLIS-family).** The ragged `cu_seqlens` path is
+the original use case — packed variable-length sequences with no padding and no
+materialized score matrix (e.g. [pixal3d-mac](https://github.com/lastowl/pixal3d-mac)).
+
+Inference only: training/autograd, sub-threshold shapes, and unsupported
+dtype/head_dim fall back to native SDPA rather than erroring.
 
 ## Performance
 
