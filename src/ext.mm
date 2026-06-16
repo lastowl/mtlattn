@@ -58,7 +58,8 @@ struct Params {
 struct Context {
     id<MTLDevice> device = nil;
     id<MTLLibrary> library = nil;
-    id<MTLLibrary> mpp_library = nil;  // optional Metal-4 MPP path (M5 + macOS 26.2+)
+    id<MTLLibrary> mpp_library = nil;  // optional Metal 4 MPP path (any GPU on macOS 26.2+)
+    bool na_capable = false;           // Apple10+ (M5+): has the per-core Neural Accelerator
     std::unordered_map<std::string, id<MTLComputePipelineState>> cache;
 
     static Context& instance() {
@@ -69,6 +70,11 @@ struct Context {
     Context() {
         device = MTLCreateSystemDefaultDevice();
         TORCH_CHECK(device != nil, "mtlattn: no Metal device");
+        // GPU family Apple10 (numeric 1010) = M5 and newer (the Neural
+        // Accelerator). Used to pick the MPP tile: M5's NA-fast matmul becomes
+        // bandwidth-bound at long sequences (TM=32 wins there), but on M3/M4 the
+        // regular matrix units stay compute-bound, so TM=16 wins at every size.
+        na_capable = [device supportsFamily:(MTLGPUFamily)1010];
 
         NSString* dir = nil;
         @autoreleasepool {
@@ -83,7 +89,8 @@ struct Context {
         library = [device newLibraryWithURL:[NSURL fileURLWithPath:[dir stringByAppendingPathComponent:@"mtlattn.metallib"]] error:&error];
         TORCH_CHECK(library != nil, "mtlattn: failed to load metallib: ",
                     error ? [[error localizedDescription] UTF8String] : "?");
-        // MPP metallib is optional — absent / fails to load on pre-M5 or pre-26.2.
+        // MPP metallib is optional — absent / fails to load before macOS 26.2
+        // (or if the build SDK lacked MetalPerformancePrimitives).
         @autoreleasepool {
             NSError* e2 = nil;
             NSString* mp = [dir stringByAppendingPathComponent:@"mtlattn_mpp.metallib"];
@@ -121,39 +128,61 @@ struct Context {
     }
 };
 
-// MPP (M5 Neural Accelerator) varlen fast-path. Returns true if it handled the
-// call. Conditions: MPP metallib present, head_dim==128, dtype half/bfloat,
-// head stride == D (contiguous heads). ~4-7x the simdgroup path on M5.
+// Metal 4 Performance-Primitives (matmul2d) varlen fast-path. Runs on any GPU
+// with macOS 26.2+ (the path is OS-gated, not GPU-family-gated); on M5 matmul2d
+// targets the per-core Neural Accelerator (~9 TFLOPS), on M3/M4 it runs on the
+// regular GPU matrix units (faster than the hand-written simdgroup kernel; exact
+// speed there is unconfirmed — no M3/M4 hardware on hand). Conditions: MPP
+// metallib loaded, head_dim in {64,128}, dtype half/bfloat, head stride == D.
 static bool try_mpp_varlen(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
                            at::Tensor& out, const at::Tensor& cu_q, const at::Tensor& cu_kv,
                            int64_t H, int64_t D, int64_t max_seqlen_q, double scale,
-                           uint32_t causal, uint32_t gqa_group, uint32_t window) {
-    if (D != 128) return false;
+                           uint32_t causal, uint32_t gqa_group, uint32_t window,
+                           const at::Tensor& lse, uint32_t return_lse) {
+    if (D != 128 && D != 64 && D != 96 && D != 256) return false;
     auto st = q.scalar_type();
     if (st != at::kHalf && st != at::kBFloat16) return false;
     // MPP wins on large sequences; small windows are faster on the simdgroup
-    // path. Gate on max_seqlen_q (override with MTLATTN_MPP_MIN).
+    // path. Gate on max_seqlen_q (override with MTLATTN_MPP_MIN). head_dim 256
+    // has no simdgroup fallback, so MPP must take it at any length.
     int64_t min_seq = 1024;
     if (const char* e = std::getenv("MTLATTN_MPP_MIN")) min_seq = atoll(e);
-    if (max_seqlen_q < min_seq) return false;
+    if (max_seqlen_q < min_seq && D != 256) return false;
     // Kernel assumes head stride == D (last dim contiguous, heads packed);
     // row stride is passed per-tensor so strided unbind views need no copy.
     if (q.stride(1) != D || k.stride(1) != D || v.stride(1) != D) return false;
     if (q.stride(2) != 1 || k.stride(2) != 1 || v.stride(2) != 1) return false;
     auto& ctx = Context::instance();
-    auto pso = ctx.mpp_pipeline(st == at::kHalf ? "attn_mpp_varlen_half" : "attn_mpp_varlen_bfloat");
+    // TM=16 maximizes occupancy mid-range; on M5 (NA) TM=32 halves K/V re-reads
+    // and wins once the NA-fast matmul goes bandwidth-bound at very long sequences
+    // (crossover ~14K with the TN=48 tile; below it TM=16 is faster). On M3/M4
+    // (no NA) the matmul stays compute-bound and TM=16 wins at every size, so
+    // TM=32 is gated to NA-capable GPUs. Override the crossover via MTLATTN_TM32_MIN.
+    int64_t tm32_min = 14336;
+    if (const char* e = std::getenv("MTLATTN_TM32_MIN")) tm32_min = atoll(e);
+    // head_dim 256 only has a TM=16 kernel (its [32,256] O accumulator can't fit
+    // threadgroup memory at TM=32).
+    const bool tm32 = ctx.na_capable && max_seqlen_q >= tm32_min && D != 256;
+    const uint32_t TM = tm32 ? 32u : 16u;
+    // attn_mpp_varlen_{half|bfloat}[_d64|_d96|_d256][_tm32]  (D=128 has no suffix)
+    std::string suffix = (D == 128) ? "" : ("_d" + std::to_string(D));
+    std::string kname = std::string("attn_mpp_varlen_") + (st == at::kHalf ? "half" : "bfloat")
+                      + suffix + (tm32 ? "_tm32" : "");
+    auto pso = ctx.mpp_pipeline(kname);
     if (pso == nil) return false;
 
     const int64_t B = cu_q.numel() - 1;
     uint32_t Hh = (uint32_t)H; float sc = (float)scale;
     uint32_t qrs=(uint32_t)q.stride(0), krs=(uint32_t)k.stride(0), vrs=(uint32_t)v.stride(0);
-    uint32_t qtiles = ((uint32_t)max_seqlen_q + 15) / 16;
+    uint32_t qtiles = ((uint32_t)max_seqlen_q + TM - 1) / TM;   // q tiles of TM rows
     id<MTLBuffer> qb=at::native::mps::getMTLBufferStorage(q), kb=at::native::mps::getMTLBufferStorage(k),
                   vb=at::native::mps::getMTLBufferStorage(v), ob=at::native::mps::getMTLBufferStorage(out),
                   cqb=at::native::mps::getMTLBufferStorage(cu_q), ckb=at::native::mps::getMTLBufferStorage(cu_kv);
     NSUInteger es = q.element_size();
     NSUInteger qo=q.storage_offset()*es, ko=k.storage_offset()*es, vo=v.storage_offset()*es, oo=out.storage_offset()*es,
                cqo=cu_q.storage_offset()*4, cko=cu_kv.storage_offset()*4;
+    id<MTLBuffer> lb=at::native::mps::getMTLBufferStorage(lse);
+    NSUInteger lo=lse.storage_offset()*4; uint32_t rlse=return_lse;
     auto* stream = at::mps::getCurrentMPSStream();
     MTLSize tg = MTLSizeMake(qtiles, (NSUInteger)B, (NSUInteger)H);
     MTLSize tpt = MTLSizeMake(pso.threadExecutionWidth * 4, 1, 1);
@@ -169,6 +198,7 @@ static bool try_mpp_varlen(const at::Tensor& q, const at::Tensor& k, const at::T
             [enc setBytes:&causal length:4 atIndex:11];
             [enc setBytes:&gqa_group length:4 atIndex:12];
             [enc setBytes:&window length:4 atIndex:13];
+            [enc setBuffer:lb offset:lo atIndex:14]; [enc setBytes:&rlse length:4 atIndex:15];
             [enc dispatchThreadgroups:tg threadsPerThreadgroup:tpt];
             [enc endEncoding];
         }
@@ -182,6 +212,11 @@ struct KernelCfg {
     uint32_t tg_threads;   // 32 * simdgroups
 };
 
+// block_q / tg_threads MUST match the kernel instantiation's BQ (= 8*SGS) and
+// thread count (= 32*SGS) in attention.metal — the kernel's compile-time TGS is
+// 32*SGS, so launching fewer threads silently leaves the upper simdgroups' query
+// rows uncomputed. half/bf16 use the mixed-precision SGS=8 (BQ=64) kernels;
+// fp32 stays SGS=4 (BQ=32) as its float fragments cost 2x the threadgroup memory.
 KernelCfg kernel_for_dtype(at::ScalarType t) {
     switch (t) {
         case at::kHalf: return {"varlen_attn_half", 32, 128};
@@ -213,7 +248,8 @@ at::Tensor varlen_attention(
     const auto H = q.size(1);          // query heads (H_q)
     const auto H_kv = k.size(1);       // kv heads (<= H_q for GQA/MQA)
     const auto D = q.size(2);
-    TORCH_CHECK(D <= HEAD_DIM_MAX, "mtlattn: head_dim ", D, " > ", HEAD_DIM_MAX);
+    TORCH_CHECK(D <= HEAD_DIM_MAX || D == 256,
+                "mtlattn: head_dim ", D, " unsupported (expected <= 128, or 256)");
     TORCH_CHECK(v.size(1) == H_kv && k.size(2) == D && v.size(2) == D,
                 "mtlattn: k/v head/dim shape mismatch");
     TORCH_CHECK(H_kv > 0 && H % H_kv == 0,
@@ -238,17 +274,24 @@ at::Tensor varlen_attention(
 
     auto out = at::empty({q.size(0), H, D}, q.options());
 
-    // LSE output (for backward) is only emitted by the simdgroup kernel for now,
-    // so requesting it forces that path.
     const bool want_lse = lse_out.has_value() && lse_out->defined() && lse_out->numel() > 0;
+    // The LSE buffer must always be bound; 1-elem dummy when not wanted.
+    at::Tensor lse = want_lse ? *lse_out : at::empty({1}, q.options().dtype(at::kFloat));
 
-    // Metal-4 MPP fast-path (M5 Neural Accelerator). Falls through on any
+    // Metal 4 MPP fast-path (matmul2d; M5 Neural Accelerator where present,
+    // regular matrix units on other macOS-26.2 GPUs). Emits LSE on demand, so it
+    // also serves the forward of a training step. Falls through on any
     // machine/shape it can't handle, to the portable simdgroup kernel below.
-    if (q.size(0) > 0 && !want_lse && !std::getenv("MTLATTN_NO_MPP")) {
+    if (q.size(0) > 0 && !std::getenv("MTLATTN_NO_MPP")) {
         if (try_mpp_varlen(q, k, v, out, cu_q, cu_kv, H, D, max_seqlen_q, scale,
-                           causal ? 1u : 0u, gqa_group, (uint32_t)(window > 0 ? window : 0)))
+                           causal ? 1u : 0u, gqa_group, (uint32_t)(window > 0 ? window : 0),
+                           lse, want_lse ? 1u : 0u))
             return out;
     }
+    // The portable simdgroup kernels are sized for head_dim <= 128; > 128 (256)
+    // is MPP-only, so if we reach here with D > 128 the fast path was unavailable.
+    TORCH_CHECK(D <= HEAD_DIM_MAX, "mtlattn: head_dim ", D,
+                " (> 128) requires the MPP path (macOS 26.2+, fp16/bf16, no LSE)");
 
     Params p;
     p.num_heads = (uint32_t)H;
@@ -262,11 +305,27 @@ at::Tensor varlen_attention(
     p.gqa_group = gqa_group;
     p.window = (uint32_t)(window > 0 ? window : 0);
     p.return_lse = want_lse ? 1u : 0u;
-    // buffer(7) must always be bound; use a 1-elem dummy when LSE isn't wanted.
-    at::Tensor lse = want_lse ? *lse_out : at::empty({1}, q.options().dtype(at::kFloat));
 
     auto& ctx = Context::instance();
-    const KernelCfg cfg = kernel_for_dtype(q.scalar_type());
+    KernelCfg cfg = kernel_for_dtype(q.scalar_type());
+    // Register-resident v3 kernel: head_dim==128, half/bf16. Same dispatch
+    // geometry (BQ=32, 128 threads) and buffer layout, so only the name swaps.
+    // ~8% faster than v2 and architecturally lighter (no Ss/Ps/Diag, ~1 barrier
+    // per tile). Default for its eligible shapes; opt out with MTLATTN_NO_REG.
+    if (D == 128 && !std::getenv("MTLATTN_NO_REG") &&
+        (q.scalar_type() == at::kHalf || q.scalar_type() == at::kBFloat16)) {
+        cfg.name = (q.scalar_type() == at::kHalf) ? "varlen_attn_reg_half"
+                                                  : "varlen_attn_reg_bfloat";
+        cfg.block_q = 32; cfg.tg_threads = 128;
+    }
+    // Split-D v4 (head_dim==128, half/bf16): D split across simdgroups for lower
+    // register pressure / higher occupancy. Gated by MTLATTN_SPLITD during A/B.
+    if (D == 128 && std::getenv("MTLATTN_SPLITD") &&
+        (q.scalar_type() == at::kHalf || q.scalar_type() == at::kBFloat16)) {
+        cfg.name = (q.scalar_type() == at::kHalf) ? "varlen_attn_splitd_half"
+                                                  : "varlen_attn_splitd_bfloat";
+        cfg.block_q = 24; cfg.tg_threads = 128;
+    }
     auto pso = ctx.pipeline(cfg.name);
 
     const uint64_t q_tiles = ((uint64_t)max_seqlen_q + cfg.block_q - 1) / cfg.block_q;
@@ -314,6 +373,15 @@ at::Tensor varlen_attention(
 
 // Backward: returns (dQ, dK, dV). Inputs q,k,v,o,dout,lse must be contiguous.
 // dout = grad of out. lse = [total_q, H] fp32 from the forward (return_lse).
+static std::tuple<at::Tensor, at::Tensor> mpp_bwd_dkv(
+    const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+    const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+    int64_t, double, bool, int64_t);
+static at::Tensor mpp_bwd_dq(
+    const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+    const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+    int64_t, double, bool, int64_t);
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor> varlen_attention_bwd(
     const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
     const at::Tensor& o, const at::Tensor& dout, const at::Tensor& lse,
@@ -323,6 +391,25 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> varlen_attention_bwd(
     const int64_t total_kv = k.size(0), Hkv = k.size(1);
     auto cu_q = cu_seqlens_q.contiguous(), cu_kv = cu_seqlens_kv.contiguous();
     const int64_t num_seqs = cu_q.numel() - 1;
+
+    // matmul2d backward (MPP) — ~12x the simdgroup-per-row path. head_dim 128,
+    // half/bf16, MPP available. delta is a cheap torch reduction (ordered on the
+    // MPS stream); the two matmul2d kernels do dQ and dK/dV.
+    if ((D == 128 || D == 64 || D == 96 || D == 256) && (q.scalar_type() == at::kHalf || q.scalar_type() == at::kBFloat16) &&
+        Context::instance().mpp_library != nil && !std::getenv("MTLATTN_NO_MPP")) {
+        auto delta = (dout.to(at::kFloat) * o.to(at::kFloat)).sum(-1).contiguous();  // [total_q, Hq]
+        auto cqc = cu_q.to(at::kCPU), ckc = cu_kv.to(at::kCPU);
+        const int* cqp = cqc.data_ptr<int>(); const int* ckp = ckc.data_ptr<int>();
+        int64_t maxq = 1, maxk = 1;
+        for (int64_t s = 0; s < num_seqs; ++s) {
+            maxq = std::max(maxq, (int64_t)(cqp[s+1]-cqp[s]));
+            maxk = std::max(maxk, (int64_t)(ckp[s+1]-ckp[s]));
+        }
+        auto dQf = mpp_bwd_dq(q, k, v, dout, lse, delta, cu_q, cu_kv, maxq, scale, causal, window);
+        auto dkv = mpp_bwd_dkv(q, k, v, dout, lse, delta, cu_q, cu_kv, maxk, scale, causal, window);
+        return {dQf.to(q.scalar_type()), std::get<0>(dkv).to(k.scalar_type()),
+                std::get<1>(dkv).to(v.scalar_type())};
+    }
 
     auto dQ = at::empty_like(q), dK = at::empty_like(k), dV = at::empty_like(v);
     auto delta = at::empty({total_q, Hq}, q.options().dtype(at::kFloat));
@@ -367,7 +454,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> varlen_attention_bwd(
             [enc setBuffer:lb offset:lo atIndex:4]; [enc setBuffer:db offset:delo atIndex:5];
             [enc setBuffer:dqb offset:dqo atIndex:6]; [enc setBuffer:cqb offset:cqo atIndex:7];
             [enc setBuffer:ckb offset:cko atIndex:8]; [enc setBytes:&p length:sizeof(Params) atIndex:9];
-            [enc dispatchThreads:MTLSizeMake(total_q, Hq, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            [enc dispatchThreadgroups:MTLSizeMake(total_q, Hq, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
             // dK, dV
             [enc setComputePipelineState:ps_dkv];
             [enc setBuffer:qb offset:qo atIndex:0]; [enc setBuffer:kb offset:ko atIndex:1];
@@ -376,16 +463,131 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> varlen_attention_bwd(
             [enc setBuffer:dkb offset:dko atIndex:6]; [enc setBuffer:dvb offset:dvo atIndex:7];
             [enc setBuffer:cqb offset:cqo atIndex:8]; [enc setBuffer:ckb offset:cko atIndex:9];
             [enc setBytes:&p length:sizeof(Params) atIndex:10];
-            [enc dispatchThreads:MTLSizeMake(total_kv, Hkv, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            [enc dispatchThreadgroups:MTLSizeMake(total_kv, Hkv, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
             [enc endEncoding];
         }
     });
     return {dQ, dK, dV};
 }
 
+// Test entry for the matmul2d dK/dV backward kernel (returns fp32 dK, dV).
+static std::tuple<at::Tensor, at::Tensor> mpp_bwd_dkv(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, const at::Tensor& dO,
+    const at::Tensor& lse, const at::Tensor& delta,
+    const at::Tensor& cu_q, const at::Tensor& cu_kv,
+    int64_t max_seqlen_kv, double scale, bool causal, int64_t window) {
+    const auto Hq = q.size(1), D = q.size(2), Hkv = k.size(1);
+    const uint32_t g = (uint32_t)(Hq / Hkv);
+    const int64_t num_seqs = cu_q.numel() - 1;
+    auto dK = at::zeros({k.size(0), Hkv, D}, k.options().dtype(at::kFloat));
+    auto dV = at::zeros_like(dK);
+    auto& ctx = Context::instance();
+    auto pso = ctx.mpp_pipeline(std::string("attn_mpp_bwd_dkv_") + (q.scalar_type() == at::kHalf ? "half" : "bfloat") + (D == 128 ? "" : ("_d" + std::to_string(D))));
+    TORCH_CHECK(pso != nil, "mtlattn: mpp bwd dkv pipeline unavailable");
+    auto cuq = cu_q.contiguous(), cukv = cu_kv.contiguous();
+    auto dOc = dO.contiguous();
+    uint32_t Hh = (uint32_t)Hq; float sc = (float)scale;
+    uint32_t gg = g, caus = causal ? 1u : 0u, win = (uint32_t)(window > 0 ? window : 0);
+    const uint32_t BK = (D == 256) ? 8 : 16;   // dK/dV accumulator is tight at 256
+    uint32_t ktiles = ((uint32_t)max_seqlen_kv + BK - 1) / BK;
+    NSUInteger es = q.element_size();
+    id<MTLBuffer> qb=at::native::mps::getMTLBufferStorage(q), kb=at::native::mps::getMTLBufferStorage(k),
+                  vb=at::native::mps::getMTLBufferStorage(v), dob=at::native::mps::getMTLBufferStorage(dOc),
+                  lb=at::native::mps::getMTLBufferStorage(lse), deb=at::native::mps::getMTLBufferStorage(delta),
+                  dkb=at::native::mps::getMTLBufferStorage(dK), dvb=at::native::mps::getMTLBufferStorage(dV),
+                  cqb=at::native::mps::getMTLBufferStorage(cuq), ckb=at::native::mps::getMTLBufferStorage(cukv);
+    NSUInteger qo=q.storage_offset()*es, ko=k.storage_offset()*es, vo=v.storage_offset()*es, doo=dOc.storage_offset()*es,
+               lo=lse.storage_offset()*4, deo=delta.storage_offset()*4, dko=dK.storage_offset()*4, dvo=dV.storage_offset()*4,
+               cqo=cuq.storage_offset()*4, cko=cukv.storage_offset()*4;
+    auto* stream = at::mps::getCurrentMPSStream();
+    MTLSize tg = MTLSizeMake(ktiles, (NSUInteger)num_seqs, (NSUInteger)Hkv);
+    MTLSize tpt = MTLSizeMake(pso.threadExecutionWidth * 4, 1, 1);
+    mps_dispatch_sync(stream->queue(), ^() {
+        @autoreleasepool {
+            stream->endKernelCoalescing();
+            id<MTLComputeCommandEncoder> enc = [stream->commandBuffer() computeCommandEncoder];
+            [enc setComputePipelineState:pso];
+            [enc setBuffer:qb offset:qo atIndex:0]; [enc setBuffer:kb offset:ko atIndex:1]; [enc setBuffer:vb offset:vo atIndex:2];
+            [enc setBuffer:dob offset:doo atIndex:3]; [enc setBuffer:lb offset:lo atIndex:4]; [enc setBuffer:deb offset:deo atIndex:5];
+            [enc setBuffer:dkb offset:dko atIndex:6]; [enc setBuffer:dvb offset:dvo atIndex:7];
+            [enc setBuffer:cqb offset:cqo atIndex:8]; [enc setBuffer:ckb offset:cko atIndex:9];
+            [enc setBytes:&Hh length:4 atIndex:10]; [enc setBytes:&sc length:4 atIndex:11];
+            [enc setBytes:&gg length:4 atIndex:12]; [enc setBytes:&caus length:4 atIndex:13]; [enc setBytes:&win length:4 atIndex:14];
+            [enc dispatchThreadgroups:tg threadsPerThreadgroup:tpt];
+            [enc endEncoding];
+        }
+    });
+    return {dK, dV};
+}
+
+// Test entry for the matmul2d dQ backward kernel (returns fp32 dQ).
+static at::Tensor mpp_bwd_dq(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, const at::Tensor& dO,
+    const at::Tensor& lse, const at::Tensor& delta,
+    const at::Tensor& cu_q, const at::Tensor& cu_kv,
+    int64_t max_seqlen_q, double scale, bool causal, int64_t window) {
+    const auto Hq = q.size(1), D = q.size(2), Hkv = k.size(1);
+    const uint32_t g = (uint32_t)(Hq / Hkv);
+    const int64_t num_seqs = cu_q.numel() - 1;
+    auto dQ = at::zeros({q.size(0), Hq, D}, q.options().dtype(at::kFloat));
+    auto& ctx = Context::instance();
+    auto pso = ctx.mpp_pipeline(std::string("attn_mpp_bwd_dq_") + (q.scalar_type() == at::kHalf ? "half" : "bfloat") + (D == 128 ? "" : ("_d" + std::to_string(D))));
+    TORCH_CHECK(pso != nil, "mtlattn: mpp bwd dq pipeline unavailable");
+    auto cuq = cu_q.contiguous(), cukv = cu_kv.contiguous();
+    auto dOc = dO.contiguous();
+    uint32_t Hh = (uint32_t)Hq; float sc = (float)scale;
+    uint32_t gg = g, caus = causal ? 1u : 0u, win = (uint32_t)(window > 0 ? window : 0);
+    const uint32_t BQ = (D == 256) ? 16 : 32;   // dQ accumulator is tight at 256
+    uint32_t qtiles = ((uint32_t)max_seqlen_q + BQ - 1) / BQ;
+    NSUInteger es = q.element_size();
+    id<MTLBuffer> qb=at::native::mps::getMTLBufferStorage(q), kb=at::native::mps::getMTLBufferStorage(k),
+                  vb=at::native::mps::getMTLBufferStorage(v), dob=at::native::mps::getMTLBufferStorage(dOc),
+                  lb=at::native::mps::getMTLBufferStorage(lse), deb=at::native::mps::getMTLBufferStorage(delta),
+                  dqb=at::native::mps::getMTLBufferStorage(dQ),
+                  cqb=at::native::mps::getMTLBufferStorage(cuq), ckb=at::native::mps::getMTLBufferStorage(cukv);
+    NSUInteger qo=q.storage_offset()*es, ko=k.storage_offset()*es, vo=v.storage_offset()*es, doo=dOc.storage_offset()*es,
+               lo=lse.storage_offset()*4, deo=delta.storage_offset()*4, dqo=dQ.storage_offset()*4,
+               cqo=cuq.storage_offset()*4, cko=cukv.storage_offset()*4;
+    auto* stream = at::mps::getCurrentMPSStream();
+    MTLSize tg = MTLSizeMake(qtiles, (NSUInteger)num_seqs, (NSUInteger)Hq);
+    MTLSize tpt = MTLSizeMake(pso.threadExecutionWidth * 4, 1, 1);
+    mps_dispatch_sync(stream->queue(), ^() {
+        @autoreleasepool {
+            stream->endKernelCoalescing();
+            id<MTLComputeCommandEncoder> enc = [stream->commandBuffer() computeCommandEncoder];
+            [enc setComputePipelineState:pso];
+            [enc setBuffer:qb offset:qo atIndex:0]; [enc setBuffer:kb offset:ko atIndex:1]; [enc setBuffer:vb offset:vo atIndex:2];
+            [enc setBuffer:dob offset:doo atIndex:3]; [enc setBuffer:lb offset:lo atIndex:4]; [enc setBuffer:deb offset:deo atIndex:5];
+            [enc setBuffer:dqb offset:dqo atIndex:6];
+            [enc setBuffer:cqb offset:cqo atIndex:7]; [enc setBuffer:ckb offset:cko atIndex:8];
+            [enc setBytes:&Hh length:4 atIndex:9]; [enc setBytes:&sc length:4 atIndex:10];
+            [enc setBytes:&gg length:4 atIndex:11]; [enc setBytes:&caus length:4 atIndex:12]; [enc setBytes:&win length:4 atIndex:13];
+            [enc dispatchThreadgroups:tg threadsPerThreadgroup:tpt];
+            [enc endEncoding];
+        }
+    });
+    return dQ;
+}
+
 }  // namespace
 
+// Diagnostic: is the Metal 4 MPP (matmul2d) fast path usable on this machine?
+// True iff the mpp metallib loaded and a kernel compiles to a pipeline — i.e.
+// macOS 26.2+ with MPP support. Used to confirm the path runs on M3/M4, not just M5.
+static bool mpp_available() {
+    return Context::instance().mpp_pipeline("attn_mpp_varlen_half") != nil;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("mpp_available", &mpp_available, "True if the Metal 4 MPP fast path is usable here");
+    m.def("mpp_bwd_dkv", &mpp_bwd_dkv, "matmul2d dK/dV backward (test entry)",
+          py::arg("q"), py::arg("k"), py::arg("v"), py::arg("dO"), py::arg("lse"), py::arg("delta"),
+          py::arg("cu_q"), py::arg("cu_kv"), py::arg("max_seqlen_kv"), py::arg("scale"),
+          py::arg("causal") = false, py::arg("window") = 0);
+    m.def("mpp_bwd_dq", &mpp_bwd_dq, "matmul2d dQ backward (test entry)",
+          py::arg("q"), py::arg("k"), py::arg("v"), py::arg("dO"), py::arg("lse"), py::arg("delta"),
+          py::arg("cu_q"), py::arg("cu_kv"), py::arg("max_seqlen_q"), py::arg("scale"),
+          py::arg("causal") = false, py::arg("window") = 0);
     m.def("varlen_attention", &varlen_attention,
           "Fused varlen attention forward (MPS)",
           py::arg("q"), py::arg("k"), py::arg("v"),

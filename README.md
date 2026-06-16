@@ -8,12 +8,14 @@ Variable-length (`cu_seqlens`) attention is the core; it also does **causal
 masking, GQA/MQA, and sliding-window** attention, and ships a
 `scaled_dot_product_attention` drop-in so existing models use it unchanged.
 
-- **Two runtime paths, selected automatically**: the M5 per-core Neural
-  Accelerator (Metal 4 `matmul2d`) where available, a portable
-  `simdgroup_matrix` kernel on M1–M4. One wheel covers both.
+- **Two runtime paths, selected automatically**: the Metal 4 `matmul2d`
+  accelerator path (any GPU on macOS 26.2+ — M5's Neural Accelerator where
+  present, regular matrix units on M3/M4) for head_dim 64/128, and a portable
+  `simdgroup_matrix` kernel everywhere else. One wheel covers both.
 - **Forward + backward** — `varlen_attention` is differentiable, so it trains
   (the one thing the MFA-based MPS kernels don't do for ragged sequences). The
-  backward kernel is correct but not yet tiled-optimized. `head_dim ≤ 128`;
+  backward uses a simdgroup-per-row kernel (~3.5× the forward, near the FLOPs
+  ideal). head_dim 64/96/128/256 on the fast path, any ≤128 on the fallback;
   fp16 / bf16 / fp32.
 
 Built for [pixal3d-mac](https://github.com/lastowl/pixal3d-mac) (image-to-3D on
@@ -54,9 +56,10 @@ pip install mtlattn
 Requires macOS on Apple Silicon and PyTorch with MPS. The published wheels are
 built against **torch 2.12** for **Python 3.11–3.13** (a torch C++ extension is
 tied to the torch version it was built against). One arm64 wheel covers every
-Apple Silicon Mac — M1–M4 use the simdgroup path, M5 the accelerator path,
-selected at runtime; both metallibs are bundled and the MPP framework is
-weak-linked, so it loads on macOS 13+.
+Apple Silicon Mac — the Metal 4 `matmul2d` accelerator path runs on any GPU with
+macOS 26.2+ (M3/M4/M5; confirmed on M4), the portable simdgroup path covers M1/M2
+and pre-26.2; selected at runtime. Both metallibs are bundled and the MPP
+framework is weak-linked, so it loads on macOS 13+.
 
 On other torch versions, build from source:
 
@@ -120,11 +123,14 @@ the same adapter callable directly.
 custom patterns — is on the roadmap; today only padding/causal/window are
 accelerated.)
 
-`head_dim <= 128`. **Differentiable** — if `q`/`k`/`v` require grad,
+**head_dim**: 64/96/128/256 run on the accelerator (MPP) path; any other
+`head_dim ≤ 128` runs on the portable simdgroup kernel; `head_dim` 256 needs the
+MPP path (macOS 26.2+). **Differentiable** — if `q`/`k`/`v` require grad,
 `varlen_attention` routes through the backward kernel (training), composing
 with causal / GQA / sliding-window; otherwise it uses the fast inference path.
-The backward is correct but currently a naive (un-tiled) kernel — slow on large
-sequences; a tiled version is future work.
+The backward is a simdgroup-per-row kernel (32 lanes cooperate on head_dim via
+`simd_sum`), ~3.5× the forward; a fully simdgroup-matrix-tiled backward is
+possible future work.
 
 Runnable tour of all of the above: [`examples/quickstart.py`](examples/quickstart.py).
 
@@ -166,20 +172,39 @@ dtype/head_dim fall back to native SDPA rather than erroring.
 ## Performance
 
 Two kernel paths, selected automatically at runtime:
-- **MPP path** (default on M5 + macOS 26.2+): fused varlen attention through
-  Metal 4 Metal Performance Primitives `matmul2d`, targeting the M5 per-core
-  **Neural Accelerator** (fp16/bf16 operands, fp32 accumulate).
+- **MPP path** (default on **any GPU with macOS 26.2+**, head_dim 64/96/128/256,
+  fp16/bf16): fused varlen attention through Metal 4 Metal Performance Primitives
+  `matmul2d`. The path is OS-gated, not GPU-family-gated — on M5 `matmul2d`
+  targets the per-core **Neural Accelerator** (~9 TFLOPS); on M3/M4 it runs on the
+  regular GPU matrix units (**confirmed on an M4: ~1.9 TFLOPS, ~3–4× the
+  simdgroup kernel and ~2–3× native SDPA**). The size-adaptive query tile (TM
+  16↔32) is gated to Apple10+ GPUs — M3/M4 always use TM=16, which is fastest
+  there at every length.
 - **simdgroup path** (portable, M1+): the fallback used on older GPUs, older
-  macOS, non-128 head dims, or when `MTLATTN_NO_MPP=1`. Tiled at 4 simdgroups
-  / BK=8 so 4 resident simdgroups hide device-load latency (~1.5× a naive
-  2-simdgroup tiling).
+  macOS, head dims other than 64/128, or when `MTLATTN_NO_MPP=1`. For head_dim
+  128 it's a register-resident kernel — scores/probs/output live in
+  simdgroup-matrix registers (in-register softmax + online rescale, no
+  threadgroup score buffers), mixed-precision matmul (half/bf16 operands, fp32
+  accumulators).
 
-M5 Pro, bf16, 12 heads, head_dim 128, through the API:
+M5 Pro, fp16, 12 heads, head_dim 128, through the API:
 
-| Path | TFLOPS | vs naive simdgroup |
+| Path | TFLOPS | notes |
 |---|---|---|
-| simdgroup (tiled) | ~0.8 | 1.5× |
-| **MPP (M5 accelerator)** | **~5.0** | **~10×** |
+| simdgroup (register-resident) | ~1.2 | portable M1+; ~0.4× native MPS SDPA on *dense* shapes |
+| **MPP (M5 accelerator)** | **~10** | **~8× the simdgroup path; ~3.4× native SDPA (~2.9)** |
+
+The MPP path streams K/V in TM=16 query tiles with the online-softmax output
+accumulated in threadgroup memory via `matmul2d` multiply-accumulate, a
+2-threads-per-row parallel softmax between the matmuls, and a TN=48 key tile.
+~33% of the M5 Neural Accelerator's ~30-TFLOPS fp16 matmul peak, ~77% of the
+practical flash-attention ceiling. The backward runs on the same `matmul2d` path
+(~12 TFLOPS, faster than the forward — it's more matmul-dense).
+
+The simdgroup path is a portable fallback, not a dense-SDPA competitor: on equal-
+length dense attention native MPS SDPA is faster (~2.9 TFLOPS). mtlattn wins
+where SDPA can't go — ragged/windowed/varlen shapes (no padding, no `[L,L]`
+matrix), the M5 accelerator, training (backward), and the >2³² correctness bug.
 
 vs padded SDPA (the usual MPS fallback): mtlattn runs windowed/ragged
 attention ~20× faster, handles 49K-token sequences in constant memory where

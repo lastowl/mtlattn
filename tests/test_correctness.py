@@ -225,7 +225,24 @@ def main():
     # single long sequence
     results.append(run_case("1x16384", [16384], [16384], 12, 128, torch.float16, 5e-3))
 
-    # causal masking. D=128 exercises the MPP path, D=64 the simdgroup path;
+    # head_dim=64 on the MPP path (seqlen >= the MPP gate so it isn't the
+    # simdgroup fallback). matmul2d is dimension-general; D=64 covers many LLMs.
+    results.append(run_case("D=64 MPP full", [2048], [2048], 12, 64, torch.float16, 5e-3))
+    results.append(run_case("D=64 MPP causal", [4096], [4096], 12, 64, torch.float16, 5e-3, causal=True))
+    results.append(run_case("D=64 MPP bf16", [1500], [1500], 8, 64, torch.bfloat16, 3e-2, causal=True))
+    results.append(run_case("D=64 MPP SWA", [2048], [2048], 12, 64, torch.float16, 5e-3, causal=True, window=128))
+    results.append(run_case("D=96 MPP causal", [2048], [2048], 12, 96, torch.float16, 5e-3, causal=True))
+    results.append(run_case("D=96 MPP bf16", [1500], [1500], 8, 96, torch.bfloat16, 3e-2))
+    # head_dim > 128 (256) — MPP-only (no simdgroup kernel that large), so only
+    # exercise it where the MPP path is available (macOS 26.2+, not MTLATTN_NO_MPP).
+    if mtlattn._C.mpp_available() and not os.environ.get("MTLATTN_NO_MPP"):
+        results.append(run_case("D=256 MPP full", [2048], [2048], 8, 256, torch.float16, 5e-3))
+        results.append(run_case("D=256 MPP causal", [1024], [1024], 12, 256, torch.float16, 5e-3, causal=True))
+        results.append(run_case("D=256 MPP bf16", [1500], [1500], 8, 256, torch.bfloat16, 4e-2, causal=True))
+    # head_dim not on the fast path (<=128) falls back to simdgroup, still correct
+    results.append(run_case("D=80 simdgroup", [200, 700], [200, 700], 8, 80, torch.float16, 5e-3, causal=True))
+
+    # causal masking. D in {64,128} large -> MPP path, small/odd-D -> simdgroup;
     # ragged batches and a cross (q_len<kv_len, cached-decode) offset included.
     results.append(run_case("causal self D=128", [1024], [1024], 12, 128, torch.float16, 5e-3, causal=True))
     results.append(run_case("causal self bf16", [777], [777], 8, 128, torch.bfloat16, 3e-2, causal=True))
@@ -256,6 +273,15 @@ def main():
     results.append(run_bwd_case("bwd window", [512], [512], 8, 8, 128, torch.float32, 1e-4, causal=True, window=64))
     results.append(run_bwd_case("bwd varlen GQA", [128, 300], [128, 300], 12, 4, 128, torch.float32, 1e-4, causal=True))
     results.append(run_bwd_case("bwd fp16 causal", [256], [256], 8, 8, 128, torch.float16, 5e-3, causal=True))
+    # fp16/bf16 D=128 backward exercises the matmul2d (MPP) path, incl. packed ragged.
+    results.append(run_bwd_case("bwd fp16 varlen", [128, 300, 64], [128, 300, 64], 8, 8, 128, torch.float16, 5e-3, causal=True))
+    results.append(run_bwd_case("bwd fp16 varlen GQA", [200, 50, 333], [200, 50, 333], 12, 4, 128, torch.float16, 6e-3, causal=True))
+    results.append(run_bwd_case("bwd fp16 window", [512], [512], 8, 8, 128, torch.float16, 5e-3, causal=True, window=64))
+    results.append(run_bwd_case("bwd bf16 varlen", [180, 90], [180, 90], 8, 8, 128, torch.bfloat16, 4e-2, causal=True))
+    results.append(run_bwd_case("bwd fp16 D=64", [200, 50], [200, 50], 8, 8, 64, torch.float16, 5e-3, causal=True))
+    results.append(run_bwd_case("bwd fp16 D=96 GQA", [256], [256], 8, 2, 96, torch.float16, 6e-3, causal=True))
+    if mtlattn._C.mpp_available() and not os.environ.get("MTLATTN_NO_MPP"):
+        results.append(run_bwd_case("bwd fp16 D=256", [512], [512], 8, 8, 256, torch.float16, 6e-3, causal=True))
 
     # The SDPA adapter cases go through torch's own MPS ops (permute/contiguous
     # -> a runtime-compiled transpose shader). Set MTLATTN_SKIP_SDPA to skip them

@@ -160,12 +160,17 @@ kernel void attn_mpp_flash(
 
 // ---- varlen + multi-head: Q,K,V,O as [total_tokens, H, D] ----
 // grid (q_tiles, num_seqs, H). Head-strided tensor_inline (strides {1, H*D}).
-// O accumulated in THREADGROUP (TM=16) via manual rescale+add (no device scratch).
+// O lives in THREADGROUP memory; the online rescale is a manual O*=corr, then
+// O += P@V via matmul2d multiply_accumulate straight into it (no PV scratch
+// buffer). TM=16/TN=32/SG=4 is the measured occupancy optimum on M5 — this path
+// is occupancy-bound, so the small threadgroup footprint matters more than tile
+// size (TM=32 and TM=64-register both regress; see attn_vl_coop note below).
 template <typename T, int TM, int TN, int D, int SG>
 inline void attn_vl(device const T* Q, device const T* K, device const T* V, device T* O,
                     device const int* cu_q, device const int* cu_kv, uint H, float scale,
                     uint q_rs, uint k_rs, uint v_rs, uint causal, uint g, uint window,
-                    threadgroup float* Sb, threadgroup T* Pb, threadgroup float* PVb,
+                    device float* lse, uint return_lse,
+                    threadgroup float* Sb, threadgroup T* Pb,
                     threadgroup float* Ob, threadgroup float* mb, threadgroup float* lb, threadgroup float* cb,
                     uint tid, uint qtile, uint seq, uint head)
 {
@@ -191,7 +196,7 @@ inline void attn_vl(device const T* Q, device const T* K, device const T* V, dev
     HT tQ((device T*)Q + ulong(q0) * qrs + ho_q, dextents<int32_t, 2>(D, q_cnt), stq);
     TGSf tS(Sb, dextents<int32_t, 2>(TN, TM));
     TGSh tP(Pb, dextents<int32_t, 2>(TN, TM));
-    TGSf tPV(PVb, dextents<int32_t, 2>(D, TM));
+    TGSf tOb(Ob, dextents<int32_t, 2>(D, TM));
 
     for (uint i = tid; i < TM * D; i += NT) Ob[i] = 0.0f;
     for (uint r = tid; r < TM; r += NT) { mb[r] = -INFINITY; lb[r] = 0.0f; }
@@ -215,66 +220,346 @@ inline void attn_vl(device const T* Q, device const T* K, device const T* V, dev
           matmul2d<d, execution_simdgroups<SG>> op;
           auto a = tQ.slice(0, 0); auto b = tK.slice(0, 0); auto c = tS.slice(0, 0); op.run(a, b, c); }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint r = tid; r < TM; r += NT) {
+        // Parallel softmax: LPR = NT/TM threads cooperate per row (vs the old
+        // one-thread-per-row, which left NT-TM threads idle between two fast
+        // matmuls). The LPR threads of a row are consecutive lanes in one
+        // simdgroup, so the row max/sum reduce with simd_shuffle_xor.
+        constexpr uint LPR = 2u;   // threads cooperating per row (measured optimum:
+                                   // >2 causes threadgroup-memory contention here)
+        const uint row = tid / LPR, sub = tid % LPR;
+        // Apple GPUs compute exp() as exp2(x*log2e), so fold log2(e) into the
+        // scale and call exp2 directly — saves a multiply per element on the
+        // exp-heavy softmax. m/scores are then in base-2 units internally (fine;
+        // this path emits no LSE, and the weights/sums are mathematically equal).
+        const float scl = scale * 1.4426950408889634f;
+        if (row < uint(TM)) {
             int lim = tk;
-            if (causal) { int h = (q0 - q_start) + int(r) + coff - kvbase + 1; lim = clamp(h, 0, tk); }
+            if (causal) { int h = (q0 - q_start) + int(row) + coff - kvbase + 1; lim = clamp(h, 0, tk); }
             int lo = 0;
-            if (window > 0) { int dl = (q0 - q_start) + int(r) + coff - int(window) + 1 - kvbase; lo = clamp(dl, 0, lim); }
-            float m_old = mb[r], tmax = m_old;
-            for (int c = lo; c < lim; ++c) tmax = max(tmax, Sb[r*TN+c]*scale);
+            if (window > 0) { int dl = (q0 - q_start) + int(row) + coff - int(window) + 1 - kvbase; lo = clamp(dl, 0, lim); }
+            const float m_old = mb[row];
+            // max(S*scl) == scl*max(S) for scl>0, so scan raw scores and scale
+            // the reduced max once (saves a multiply per key in the hot scan).
+            float rawmax = -INFINITY;
+            for (uint c = sub; c < uint(TN); c += LPR)
+                if (int(c) >= lo && int(c) < lim) rawmax = max(rawmax, Sb[row*TN+c]);
+            for (uint o = 1; o < LPR; o <<= 1) rawmax = max(rawmax, simd_shuffle_xor(rawmax, o));
+            const float tmax = (rawmax == -INFINITY) ? m_old : max(m_old, rawmax * scl);
             // tmax stays -inf when this tile has no keys for the row (windowed
-            // band skips it); rescale is then a no-op (1), not exp(-inf+inf)=NaN.
-            float corr = (tmax == -INFINITY) ? 1.0f : exp(m_old - tmax), tsum = 0.0f;
-            for (uint c = 0; c < TN; ++c) { float w=((int(c)>=lo)&&(int(c)<lim))?exp(Sb[r*TN+c]*scale-tmax):0.0f; tsum+=w; Pb[r*TN+c]=T(w); }
-            mb[r] = tmax; lb[r] = lb[r]*corr + tsum; cb[r] = corr;
+            // band skips it); rescale is then a no-op (1), not exp2(-inf+inf)=NaN.
+            const float corr = (tmax == -INFINITY) ? 1.0f : exp2(m_old - tmax);
+            float tsum = 0.0f;
+            for (uint c = sub; c < uint(TN); c += LPR) {
+                float w = ((int(c) >= lo) && (int(c) < lim)) ? exp2(Sb[row*TN+c]*scl - tmax) : 0.0f;
+                tsum += w; Pb[row*TN+c] = T(w);
+            }
+            for (uint o = 1; o < LPR; o <<= 1) tsum += simd_shuffle_xor(tsum, o);
+            if (sub == 0) { mb[row] = tmax; lb[row] = lb[row]*corr + tsum; cb[row] = corr; }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        { constexpr auto d = matmul2d_descriptor(TM, D, static_cast<int>(dynamic_extent), false, false, false);
-          matmul2d<d, execution_simdgroups<SG>> op;
-          auto a = tP.slice(0, 0); auto b = tV.slice(0, 0); auto c = tPV.slice(0, 0); op.run(a, b, c); }
+        // Rescale the O accumulator by corr, then O += P@V via matmul2d
+        // multiply_accumulate straight into Ob — no separate PV buffer, so TM can
+        // double (16->32) within the 32 KB budget, halving the K/V re-reads that
+        // bound this kernel.
+        for (uint i = tid; i < TM * D; i += NT) Ob[i] *= cb[i / D];
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint i = tid; i < TM * D; i += NT) { uint r = i / D; Ob[i] = Ob[i]*cb[r] + PVb[i]; }
+        { constexpr auto d = matmul2d_descriptor(TM, D, static_cast<int>(dynamic_extent), false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+          matmul2d<d, execution_simdgroups<SG>> op;
+          auto a = tP.slice(0, 0); auto b = tV.slice(0, 0); auto c = tOb.slice(0, 0); op.run(a, b, c); }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     for (uint r = tid; r < TM; r += NT) {
         if (int(r) >= q_cnt) continue;
-        float inv = (lb[r] > 0.0f) ? 1.0f/lb[r] : 0.0f;
+        const float l = lb[r];
+        float inv = (l > 0.0f) ? 1.0f/l : 0.0f;
         ulong base = ulong(q0 + int(r)) * o_rs + head * D;
         for (uint dd = 0; dd < D; ++dd) O[base + dd] = T(Ob[r*D+dd]*inv);
+        // mb is the running max in base-2 units (exp2 softmax), so convert back:
+        // lse = m_natural + log(l) = mb*ln(2) + log(l). Backward recomputes
+        // P = exp(scale*S - lse) from this.
+        if (return_lse)
+            lse[ulong(q0 + int(r)) * H + head] =
+                (l > 0.0f) ? (mb[r] * 0.69314718055994531f + log(l)) : -INFINITY;
     }
 }
 
-kernel void attn_mpp_varlen_half(
-    device const half* Q [[buffer(0)]], device const half* K [[buffer(1)]], device const half* V [[buffer(2)]],
-    device half* O [[buffer(3)]], device const int* cu_q [[buffer(4)]], device const int* cu_kv [[buffer(5)]],
-    constant uint& H [[buffer(6)]], constant float& scale [[buffer(7)]],
-    constant uint& q_rs [[buffer(8)]], constant uint& k_rs [[buffer(9)]], constant uint& v_rs [[buffer(10)]],
-    constant uint& causal [[buffer(11)]], constant uint& g [[buffer(12)]],
-    constant uint& window [[buffer(13)]],
-    uint tid [[thread_index_in_threadgroup]], uint3 tgid [[threadgroup_position_in_grid]])
+// TM is dispatched by sequence length: TM=16 maximizes occupancy at mid-range
+// (the win below ~10K tokens), TM=32 halves the K/V re-reads and wins at long
+// sequences where the GPU is already saturated (>=~10K, e.g. 3D-sparse
+// transformers). The host picks the kernel by max_seqlen_q.
+#define INSTANTIATE_MPP_VL(NAME, T, TM_, D_)                                    \
+kernel void NAME(                                                               \
+    device const T* Q [[buffer(0)]], device const T* K [[buffer(1)]], device const T* V [[buffer(2)]], \
+    device T* O [[buffer(3)]], device const int* cu_q [[buffer(4)]], device const int* cu_kv [[buffer(5)]], \
+    constant uint& H [[buffer(6)]], constant float& scale [[buffer(7)]],        \
+    constant uint& q_rs [[buffer(8)]], constant uint& k_rs [[buffer(9)]], constant uint& v_rs [[buffer(10)]], \
+    constant uint& causal [[buffer(11)]], constant uint& g [[buffer(12)]],      \
+    constant uint& window [[buffer(13)]],                                       \
+    device float* lse [[buffer(14)]], constant uint& return_lse [[buffer(15)]], \
+    uint tid [[thread_index_in_threadgroup]], uint3 tgid [[threadgroup_position_in_grid]]) \
+{                                                                               \
+    constexpr int TM=TM_,TN=48,D=D_,SG=4;                                       \
+    threadgroup float Sb[TM*TN]; threadgroup T Pb[TM*TN];                       \
+    threadgroup float Ob[TM*D];                                                 \
+    threadgroup float mb[TM], lb[TM], cb[TM];                                   \
+    attn_vl<T,TM,TN,D,SG>(Q,K,V,O,cu_q,cu_kv,H,scale,q_rs,k_rs,v_rs,causal,g,window,lse,return_lse,Sb,Pb,Ob,mb,lb,cb,tid,tgid.x,tgid.y,tgid.z); \
+}
+// matmul2d is dimension-general, so the same kernel serves any head_dim. We
+// instantiate the common dims: 64/96/128 (cover ~all transformers) get both TM
+// tiles; 256 (the realistic >128 case) gets TM=16 only — at TM=32 its [32,256]
+// fp32 O accumulator alone is 32 KB, the whole threadgroup budget.
+INSTANTIATE_MPP_VL(attn_mpp_varlen_half,            half,   16, 128)
+INSTANTIATE_MPP_VL(attn_mpp_varlen_half_tm32,       half,   32, 128)
+INSTANTIATE_MPP_VL(attn_mpp_varlen_bfloat,          bfloat, 16, 128)
+INSTANTIATE_MPP_VL(attn_mpp_varlen_bfloat_tm32,     bfloat, 32, 128)
+INSTANTIATE_MPP_VL(attn_mpp_varlen_half_d64,        half,   16, 64)
+INSTANTIATE_MPP_VL(attn_mpp_varlen_half_d64_tm32,   half,   32, 64)
+INSTANTIATE_MPP_VL(attn_mpp_varlen_bfloat_d64,      bfloat, 16, 64)
+INSTANTIATE_MPP_VL(attn_mpp_varlen_bfloat_d64_tm32, bfloat, 32, 64)
+INSTANTIATE_MPP_VL(attn_mpp_varlen_half_d96,        half,   16, 96)
+INSTANTIATE_MPP_VL(attn_mpp_varlen_half_d96_tm32,   half,   32, 96)
+INSTANTIATE_MPP_VL(attn_mpp_varlen_bfloat_d96,      bfloat, 16, 96)
+INSTANTIATE_MPP_VL(attn_mpp_varlen_bfloat_d96_tm32, bfloat, 32, 96)
+INSTANTIATE_MPP_VL(attn_mpp_varlen_half_d256,       half,   16, 256)
+INSTANTIATE_MPP_VL(attn_mpp_varlen_bfloat_d256,     bfloat, 16, 256)
+
+
+// ============================================================================
+// Backward dK/dV on matmul2d (flash-attn-2 structure). One threadgroup owns a
+// BK-key block of one (seq, kv-head); it loops the g query heads that map to
+// this kv-head and all BQ-query tiles, recomputing S=Q@K^T and P=exp(scale*S-lse)
+// and accumulating dV += P^T@dO and dK += scale*dS^T@Q, with dS=P∘(dP-delta),
+// dP=dO@V^T. delta[i]=Σ_d dO[i,d]·O[i,d] is precomputed (bwd_delta). Masks
+// (causal/window) are applied per-element when forming P. dK/dV accumulate in
+// threadgroup fp32; matmul operands are the input dtype (NA fast path).
+template <typename T, int BQ, int BK, int D, int SG>
+inline void bwd_dkv_mpp(device const T* Q, device const T* K, device const T* V, device const T* dO,
+                        device const float* lse, device const float* delta,
+                        device float* dK, device float* dV,
+                        device const int* cu_q, device const int* cu_kv,
+                        uint H, float scale, uint g, uint causal, uint window,
+                        threadgroup float* Sb, threadgroup T* Pb,
+                        threadgroup float* dKb, threadgroup float* dVb,
+                        uint tid, uint ktile, uint seq, uint kvhead)
 {
-    constexpr int TM=16,TN=64,D=128,SG=4;
-    threadgroup float Sb[TM*TN]; threadgroup half Pb[TM*TN];
-    threadgroup float PVb[TM*D]; threadgroup float Ob[TM*D];
-    threadgroup float mb[TM], lb[TM], cb[TM];
-    attn_vl<half,TM,TN,D,SG>(Q,K,V,O,cu_q,cu_kv,H,scale,q_rs,k_rs,v_rs,causal,g,window,Sb,Pb,PVb,Ob,mb,lb,cb,tid,tgid.x,tgid.y,tgid.z);
+    using HT = tensor<device T, dextents<int32_t, 2>, tensor_inline>;
+    using TGSf = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>;
+    using TGSh = tensor<threadgroup T, dextents<int32_t, 2>, tensor_inline>;
+    constexpr uint NT = SG * 32;
+    const int qrs = int(H * D), krs = int((H / g) * D);     // row strides (contiguous)
+    const int dk_rs = int((H / g) * D);                     // dK/dV row = Hkv*D
+    const int q_start = cu_q[seq], q_end = cu_q[seq + 1];
+    const int kv_start = cu_kv[seq], kv_end = cu_kv[seq + 1];
+    const int kv0 = kv_start + int(ktile) * BK;
+    if (kv0 >= kv_end) return;
+    const int k_cnt = min(BK, kv_end - kv0);
+    const int kvbase = kv0 - kv_start;                      // seq-local first key
+    const int coff = (kv_end - kv_start) - (q_end - q_start);
+    thread array<int32_t, 2> st_q = {1, qrs}, st_k = {1, krs};
+
+    for (uint i = tid; i < uint(BK * D); i += NT) { dKb[i] = 0.0f; dVb[i] = 0.0f; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int ho_kv = int(kvhead * D);
+    HT tK((device T*)K + ulong(kv0) * krs + ho_kv, dextents<int32_t, 2>(D, k_cnt), st_k);
+    HT tV((device T*)V + ulong(kv0) * krs + ho_kv, dextents<int32_t, 2>(D, k_cnt), st_k);
+    TGSf tS(Sb, dextents<int32_t, 2>(BK, BQ));     // [BQ rows][BK cols]
+    TGSh tP(Pb, dextents<int32_t, 2>(BK, BQ));
+    TGSf tdK(dKb, dextents<int32_t, 2>(D, BK));    // [BK rows][D cols]
+    TGSf tdV(dVb, dextents<int32_t, 2>(D, BK));
+
+    for (uint hh = kvhead * g; hh < (kvhead + 1) * g; ++hh) {
+        const int ho_q = int(hh * D);
+        for (int q0 = q_start; q0 < q_end; q0 += BQ) {
+            const int q_cnt = min(BQ, q_end - q0);
+            const int qi0 = q0 - q_start;                  // seq-local first query
+            // Causal: this key block needs only queries i with j<=i+coff for some
+            // key j in [kvbase, kvbase+k_cnt). The earliest such query is
+            // kvbase-coff; skip query tiles entirely below it.
+            if (causal && (qi0 + q_cnt - 1) + coff < kvbase) continue;
+            HT tQ((device T*)Q + ulong(q0) * qrs + ho_q, dextents<int32_t, 2>(D, q_cnt), st_q);
+            HT tdO((device T*)dO + ulong(q0) * qrs + ho_q, dextents<int32_t, 2>(D, q_cnt), st_q);
+
+            // S = Q @ K^T  -> Sb [BQ,BK]
+            { constexpr auto d = matmul2d_descriptor(BQ, BK, static_cast<int>(dynamic_extent), false, true, false);
+              matmul2d<d, execution_simdgroups<SG>> op; auto a=tQ.slice(0,0); auto b=tK.slice(0,0); auto c=tS.slice(0,0); op.run(a,b,c); }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            // P = exp(scale*S - lse), masked
+            for (uint e = tid; e < uint(BQ * BK); e += NT) {
+                uint r = e / BK, cc = e % BK;
+                float w = 0.0f;
+                if (int(r) < q_cnt && int(cc) < k_cnt) {
+                    int il = qi0 + int(r), jl = kvbase + int(cc);
+                    bool keep = true;
+                    if (causal) keep = jl <= il + coff;
+                    if (keep && window > 0) keep = jl > il + coff - int(window);
+                    if (keep) w = exp(scale * Sb[e] - lse[ulong(q0 + int(r)) * H + hh]);
+                }
+                Pb[e] = T(w);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            // dV += P^T @ dO
+            { constexpr auto d = matmul2d_descriptor(BK, D, static_cast<int>(dynamic_extent), true, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+              matmul2d<d, execution_simdgroups<SG>> op; auto a=tP.slice(0,0); auto b=tdO.slice(0,0); auto c=tdV.slice(0,0); op.run(a,b,c); }
+            // dP = dO @ V^T -> Sb (reuse)
+            { constexpr auto d = matmul2d_descriptor(BQ, BK, static_cast<int>(dynamic_extent), false, true, false);
+              matmul2d<d, execution_simdgroups<SG>> op; auto a=tdO.slice(0,0); auto b=tV.slice(0,0); auto c=tS.slice(0,0); op.run(a,b,c); }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            // dS = P * (dP - delta) -> Pb (reuse)
+            for (uint e = tid; e < uint(BQ * BK); e += NT) {
+                uint r = e / BK;
+                float p = float(Pb[e]);
+                float ds = (int(r) < q_cnt) ? p * (Sb[e] - delta[ulong(q0 + int(r)) * H + hh]) : 0.0f;
+                Pb[e] = T(ds);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            // dK += dS^T @ Q   (scale applied at finalize)
+            { constexpr auto d = matmul2d_descriptor(BK, D, static_cast<int>(dynamic_extent), true, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+              matmul2d<d, execution_simdgroups<SG>> op; auto a=tP.slice(0,0); auto b=tQ.slice(0,0); auto c=tdK.slice(0,0); op.run(a,b,c); }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+    // Write dK (scaled) and dV.
+    for (uint e = tid; e < uint(BK * D); e += NT) {
+        uint r = e / D, dd = e % D;
+        if (int(r) < k_cnt) {
+            ulong base = ulong(kv0 + int(r)) * dk_rs + kvhead * D + dd;
+            dK[base] = dKb[e] * scale;
+            dV[base] = dVb[e];
+        }
+    }
 }
 
-kernel void attn_mpp_varlen_bfloat(
-    device const bfloat* Q [[buffer(0)]], device const bfloat* K [[buffer(1)]], device const bfloat* V [[buffer(2)]],
-    device bfloat* O [[buffer(3)]], device const int* cu_q [[buffer(4)]], device const int* cu_kv [[buffer(5)]],
-    constant uint& H [[buffer(6)]], constant float& scale [[buffer(7)]],
-    constant uint& q_rs [[buffer(8)]], constant uint& k_rs [[buffer(9)]], constant uint& v_rs [[buffer(10)]],
-    constant uint& causal [[buffer(11)]], constant uint& g [[buffer(12)]],
-    constant uint& window [[buffer(13)]],
-    uint tid [[thread_index_in_threadgroup]], uint3 tgid [[threadgroup_position_in_grid]])
-{
-    constexpr int TM=16,TN=64,D=128,SG=4;
-    threadgroup float Sb[TM*TN]; threadgroup bfloat Pb[TM*TN];
-    threadgroup float PVb[TM*D]; threadgroup float Ob[TM*D];
-    threadgroup float mb[TM], lb[TM], cb[TM];
-    attn_vl<bfloat,TM,TN,D,SG>(Q,K,V,O,cu_q,cu_kv,H,scale,q_rs,k_rs,v_rs,causal,g,window,Sb,Pb,PVb,Ob,mb,lb,cb,tid,tgid.x,tgid.y,tgid.z);
+#define INSTANTIATE_BWD_DKV(NAME, T, BQ, BK, D_)                                \
+kernel void NAME(                                                               \
+    device const T* Q [[buffer(0)]], device const T* K [[buffer(1)]], device const T* V [[buffer(2)]], \
+    device const T* dO [[buffer(3)]], device const float* lse [[buffer(4)]], device const float* delta [[buffer(5)]], \
+    device float* dK [[buffer(6)]], device float* dV [[buffer(7)]],             \
+    device const int* cu_q [[buffer(8)]], device const int* cu_kv [[buffer(9)]], \
+    constant uint& H [[buffer(10)]], constant float& scale [[buffer(11)]],      \
+    constant uint& g [[buffer(12)]], constant uint& causal [[buffer(13)]], constant uint& window [[buffer(14)]], \
+    uint tid [[thread_index_in_threadgroup]], uint3 tgid [[threadgroup_position_in_grid]]) \
+{                                                                               \
+    constexpr int BQ_=BQ, BK_=BK, D=D_, SG=4;                                   \
+    threadgroup float Sb[BQ_*BK_]; threadgroup T Pb[BQ_*BK_];                    \
+    threadgroup float dKb[BK_*D]; threadgroup float dVb[BK_*D];                  \
+    bwd_dkv_mpp<T,BQ_,BK_,D,SG>(Q,K,V,dO,lse,delta,dK,dV,cu_q,cu_kv,H,scale,g,causal,window,Sb,Pb,dKb,dVb,tid,tgid.x,tgid.y,tgid.z); \
 }
+INSTANTIATE_BWD_DKV(attn_mpp_bwd_dkv_half,   half,   32, 16, 128)
+INSTANTIATE_BWD_DKV(attn_mpp_bwd_dkv_bfloat, bfloat, 32, 16, 128)
+INSTANTIATE_BWD_DKV(attn_mpp_bwd_dkv_half_d64,   half,   32, 16, 64)
+INSTANTIATE_BWD_DKV(attn_mpp_bwd_dkv_bfloat_d64, bfloat, 32, 16, 64)
+INSTANTIATE_BWD_DKV(attn_mpp_bwd_dkv_half_d96,   half,   32, 16, 96)
+INSTANTIATE_BWD_DKV(attn_mpp_bwd_dkv_bfloat_d96, bfloat, 32, 16, 96)
+INSTANTIATE_BWD_DKV(attn_mpp_bwd_dkv_half_d256,   half,   32, 8, 256)   // BK=8: [BK,256] dK/dV tight
+INSTANTIATE_BWD_DKV(attn_mpp_bwd_dkv_bfloat_d256, bfloat, 32, 8, 256)
+
+
+// Backward dQ on matmul2d. One threadgroup owns a BQ-query block of one
+// (seq, query-head); it loops all BK-key tiles, recomputing S/P and
+// accumulating dQ += scale*dS@K, dS = P∘(dP-delta), dP = dO@V^T.
+template <typename T, int BQ, int BK, int D, int SG>
+inline void bwd_dq_mpp(device const T* Q, device const T* K, device const T* V, device const T* dO,
+                       device const float* lse, device const float* delta, device float* dQ,
+                       device const int* cu_q, device const int* cu_kv,
+                       uint H, float scale, uint g, uint causal, uint window,
+                       threadgroup float* Sb, threadgroup T* Pb, threadgroup float* dQb,
+                       uint tid, uint qtile, uint seq, uint head)
+{
+    using HT = tensor<device T, dextents<int32_t, 2>, tensor_inline>;
+    using TGSf = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>;
+    using TGSh = tensor<threadgroup T, dextents<int32_t, 2>, tensor_inline>;
+    constexpr uint NT = SG * 32;
+    const int qrs = int(H * D), krs = int((H / g) * D);
+    const int q_start = cu_q[seq], q_end = cu_q[seq + 1];
+    const int kv_start = cu_kv[seq], kv_end = cu_kv[seq + 1];
+    const int q0 = q_start + int(qtile) * BQ;
+    if (q0 >= q_end) return;
+    const int q_cnt = min(BQ, q_end - q0);
+    const int qi0 = q0 - q_start;
+    const int coff = (kv_end - kv_start) - (q_end - q_start);
+    const int q_hi = qi0 + (q_cnt - 1) + coff;             // furthest key any query sees
+    thread array<int32_t, 2> st_q = {1, qrs}, st_k = {1, krs};
+
+    for (uint i = tid; i < uint(BQ * D); i += NT) dQb[i] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int ho_q = int(head * D), ho_kv = int((head / g) * D);
+    HT tQ((device T*)Q + ulong(q0) * qrs + ho_q, dextents<int32_t, 2>(D, q_cnt), st_q);
+    HT tdO((device T*)dO + ulong(q0) * qrs + ho_q, dextents<int32_t, 2>(D, q_cnt), st_q);
+    TGSf tS(Sb, dextents<int32_t, 2>(BK, BQ));
+    TGSh tP(Pb, dextents<int32_t, 2>(BK, BQ));
+    TGSf tdQ(dQb, dextents<int32_t, 2>(D, BQ));
+
+    int kv0 = kv_start;
+    if (window > 0) { int s = qi0 + coff - int(window) + 1; if (s > 0) kv0 = kv_start + (s / BK) * BK; }
+    for (; kv0 < kv_end; kv0 += BK) {
+        const int kvbase = kv0 - kv_start;
+        if (causal && kvbase > q_hi) break;
+        const int k_cnt = min(BK, kv_end - kv0);
+        HT tK((device T*)K + ulong(kv0) * krs + ho_kv, dextents<int32_t, 2>(D, k_cnt), st_k);
+        HT tV((device T*)V + ulong(kv0) * krs + ho_kv, dextents<int32_t, 2>(D, k_cnt), st_k);
+        // S = Q @ K^T
+        { constexpr auto d = matmul2d_descriptor(BQ, BK, static_cast<int>(dynamic_extent), false, true, false);
+          matmul2d<d, execution_simdgroups<SG>> op; auto a=tQ.slice(0,0); auto b=tK.slice(0,0); auto c=tS.slice(0,0); op.run(a,b,c); }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint e = tid; e < uint(BQ * BK); e += NT) {
+            uint r = e / BK, cc = e % BK;
+            float w = 0.0f;
+            if (int(r) < q_cnt && int(cc) < k_cnt) {
+                int il = qi0 + int(r), jl = kvbase + int(cc);
+                bool keep = true;
+                if (causal) keep = jl <= il + coff;
+                if (keep && window > 0) keep = jl > il + coff - int(window);
+                if (keep) w = exp(scale * Sb[e] - lse[ulong(q0 + int(r)) * H + head]);
+            }
+            Pb[e] = T(w);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // dP = dO @ V^T -> Sb (reuse)
+        { constexpr auto d = matmul2d_descriptor(BQ, BK, static_cast<int>(dynamic_extent), false, true, false);
+          matmul2d<d, execution_simdgroups<SG>> op; auto a=tdO.slice(0,0); auto b=tV.slice(0,0); auto c=tS.slice(0,0); op.run(a,b,c); }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // dS = P * (dP - delta) -> Pb
+        for (uint e = tid; e < uint(BQ * BK); e += NT) {
+            uint r = e / BK;
+            float ds = (int(r) < q_cnt) ? float(Pb[e]) * (Sb[e] - delta[ulong(q0 + int(r)) * H + head]) : 0.0f;
+            Pb[e] = T(ds);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // dQ += dS @ K
+        { constexpr auto d = matmul2d_descriptor(BQ, D, static_cast<int>(dynamic_extent), false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+          matmul2d<d, execution_simdgroups<SG>> op; auto a=tP.slice(0,0); auto b=tK.slice(0,0); auto c=tdQ.slice(0,0); op.run(a,b,c); }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint e = tid; e < uint(BQ * D); e += NT) {
+        uint r = e / D, dd = e % D;
+        if (int(r) < q_cnt) dQ[ulong(q0 + int(r)) * qrs + head * D + dd] = dQb[e] * scale;
+    }
+}
+
+#define INSTANTIATE_BWD_DQ(NAME, T, BQ, BK, D_)                                 \
+kernel void NAME(                                                               \
+    device const T* Q [[buffer(0)]], device const T* K [[buffer(1)]], device const T* V [[buffer(2)]], \
+    device const T* dO [[buffer(3)]], device const float* lse [[buffer(4)]], device const float* delta [[buffer(5)]], \
+    device float* dQ [[buffer(6)]],                                            \
+    device const int* cu_q [[buffer(7)]], device const int* cu_kv [[buffer(8)]], \
+    constant uint& H [[buffer(9)]], constant float& scale [[buffer(10)]],       \
+    constant uint& g [[buffer(11)]], constant uint& causal [[buffer(12)]], constant uint& window [[buffer(13)]], \
+    uint tid [[thread_index_in_threadgroup]], uint3 tgid [[threadgroup_position_in_grid]]) \
+{                                                                               \
+    constexpr int BQ_=BQ, BK_=BK, D=D_, SG=4;                                   \
+    threadgroup float Sb[BQ_*BK_]; threadgroup T Pb[BQ_*BK_]; threadgroup float dQb[BQ_*D]; \
+    bwd_dq_mpp<T,BQ_,BK_,D,SG>(Q,K,V,dO,lse,delta,dQ,cu_q,cu_kv,H,scale,g,causal,window,Sb,Pb,dQb,tid,tgid.x,tgid.y,tgid.z); \
+}
+INSTANTIATE_BWD_DQ(attn_mpp_bwd_dq_half,   half,   32, 16, 128)
+INSTANTIATE_BWD_DQ(attn_mpp_bwd_dq_bfloat, bfloat, 32, 16, 128)
+INSTANTIATE_BWD_DQ(attn_mpp_bwd_dq_half_d64,   half,   32, 16, 64)
+INSTANTIATE_BWD_DQ(attn_mpp_bwd_dq_bfloat_d64, bfloat, 32, 16, 64)
+INSTANTIATE_BWD_DQ(attn_mpp_bwd_dq_half_d96,   half,   32, 16, 96)
+INSTANTIATE_BWD_DQ(attn_mpp_bwd_dq_bfloat_d96, bfloat, 32, 16, 96)
+INSTANTIATE_BWD_DQ(attn_mpp_bwd_dq_half_d256,   half,   16, 8, 256)   // BQ=16: [BQ,256] dQ tight
+INSTANTIATE_BWD_DQ(attn_mpp_bwd_dq_bfloat_d256, bfloat, 16, 8, 256)
 
 // ---- TM=64 variant with register-resident O (cooperative_tensor) ----
 //
@@ -389,7 +674,7 @@ kernel void attn_mpp_coop_half(
     constant uint& q_rs [[buffer(8)]], constant uint& k_rs [[buffer(9)]], constant uint& v_rs [[buffer(10)]],
     uint tid [[thread_index_in_threadgroup]], uint3 tgid [[threadgroup_position_in_grid]])
 {
-    constexpr int TM=64,TN=64,D=128,SG=4;
+    constexpr int TM=16,TN=32,D=128,SG=4;
     threadgroup float Sb[TM*TN]; threadgroup half Pb[TM*TN];
     threadgroup float mb[TM], lb[TM], cb[TM];
     attn_vl_coop<TM,TN,D,SG>(Q,K,V,O,cu_q,cu_kv,H,scale,q_rs,k_rs,v_rs,Sb,Pb,mb,lb,cb,tid,tgid.x,tgid.y,tgid.z);
