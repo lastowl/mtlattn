@@ -1,8 +1,8 @@
 # mtlattn
 
-Fused **flash-attention (forward)** for Apple Silicon — a Metal compute kernel
-for PyTorch MPS tensors, with online softmax, fp32 accumulation, **no padding
-and no materialized `[L, L]` score matrix**.
+Fused **flash-attention (forward + backward)** for Apple Silicon — a Metal
+compute kernel for PyTorch MPS tensors, with online softmax, fp32 accumulation,
+**no padding and no materialized `[L, L]` score matrix**.
 
 Variable-length (`cu_seqlens`) attention is the core; it also does **causal
 masking, GQA/MQA, and sliding-window** attention, and ships a
@@ -11,7 +11,10 @@ masking, GQA/MQA, and sliding-window** attention, and ships a
 - **Two runtime paths, selected automatically**: the M5 per-core Neural
   Accelerator (Metal 4 `matmul2d`) where available, a portable
   `simdgroup_matrix` kernel on M1–M4. One wheel covers both.
-- **Forward only** (inference); `head_dim ≤ 128`; fp16 / bf16 / fp32.
+- **Forward + backward** — `varlen_attention` is differentiable, so it trains
+  (the one thing the MFA-based MPS kernels don't do for ragged sequences). The
+  backward kernel is correct but not yet tiled-optimized. `head_dim ≤ 128`;
+  fp16 / bf16 / fp32.
 
 Built for [pixal3d-mac](https://github.com/lastowl/pixal3d-mac) (image-to-3D on
 Mac), but standalone: a drop-in for the `flash_attn` varlen API and for
@@ -117,7 +120,11 @@ the same adapter callable directly.
 custom patterns — is on the roadmap; today only padding/causal/window are
 accelerated.)
 
-`head_dim <= 128`. Forward only (inference); no backward pass.
+`head_dim <= 128`. **Differentiable** — if `q`/`k`/`v` require grad,
+`varlen_attention` routes through the backward kernel (training), composing
+with causal / GQA / sliding-window; otherwise it uses the fast inference path.
+The backward is correct but currently a naive (un-tiled) kernel — slow on large
+sequences; a tiled version is future work.
 
 Runnable tour of all of the above: [`examples/quickstart.py`](examples/quickstart.py).
 

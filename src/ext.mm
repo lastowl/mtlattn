@@ -51,6 +51,8 @@ struct Params {
     uint32_t causal;      // 0 = full attention; 1 = causal mask
     uint32_t gqa_group;   // query heads per kv head (1 = standard MHA)
     uint32_t window;      // 0 = unlimited; >0 = sliding window (last `window` keys)
+    uint32_t return_lse;  // 1 = also write per-query log-sum-exp (for backward)
+    uint32_t num_seqs;    // batch size (backward kernels' sequence lookup)
 };
 
 struct Context {
@@ -201,7 +203,8 @@ at::Tensor varlen_attention(
     int64_t max_seqlen_q,
     double scale,
     bool causal,
-    int64_t window
+    int64_t window,
+    c10::optional<at::Tensor> lse_out   // optional [total_q, H] fp32; if given, emit LSE
 ) {
     TORCH_CHECK(q.device().is_mps() && k.device().is_mps() && v.device().is_mps(),
                 "mtlattn: q/k/v must be MPS tensors");
@@ -235,9 +238,13 @@ at::Tensor varlen_attention(
 
     auto out = at::empty({q.size(0), H, D}, q.options());
 
+    // LSE output (for backward) is only emitted by the simdgroup kernel for now,
+    // so requesting it forces that path.
+    const bool want_lse = lse_out.has_value() && lse_out->defined() && lse_out->numel() > 0;
+
     // Metal-4 MPP fast-path (M5 Neural Accelerator). Falls through on any
     // machine/shape it can't handle, to the portable simdgroup kernel below.
-    if (q.size(0) > 0 && !std::getenv("MTLATTN_NO_MPP")) {
+    if (q.size(0) > 0 && !want_lse && !std::getenv("MTLATTN_NO_MPP")) {
         if (try_mpp_varlen(q, k, v, out, cu_q, cu_kv, H, D, max_seqlen_q, scale,
                            causal ? 1u : 0u, gqa_group, (uint32_t)(window > 0 ? window : 0)))
             return out;
@@ -254,6 +261,9 @@ at::Tensor varlen_attention(
     p.causal = causal ? 1u : 0u;
     p.gqa_group = gqa_group;
     p.window = (uint32_t)(window > 0 ? window : 0);
+    p.return_lse = want_lse ? 1u : 0u;
+    // buffer(7) must always be bound; use a 1-elem dummy when LSE isn't wanted.
+    at::Tensor lse = want_lse ? *lse_out : at::empty({1}, q.options().dtype(at::kFloat));
 
     auto& ctx = Context::instance();
     const KernelCfg cfg = kernel_for_dtype(q.scalar_type());
@@ -268,6 +278,8 @@ at::Tensor varlen_attention(
     id<MTLBuffer> ob = at::native::mps::getMTLBufferStorage(out);
     id<MTLBuffer> cqb = at::native::mps::getMTLBufferStorage(cu_q);
     id<MTLBuffer> ckb = at::native::mps::getMTLBufferStorage(cu_kv);
+    id<MTLBuffer> lb = at::native::mps::getMTLBufferStorage(lse);
+    const NSUInteger lse_off = lse.storage_offset() * 4;
 
     const NSUInteger q_off = q.storage_offset() * q.element_size();
     const NSUInteger k_off = k.storage_offset() * k.element_size();
@@ -290,6 +302,7 @@ at::Tensor varlen_attention(
             [enc setBuffer:cqb offset:cq_off atIndex:4];
             [enc setBuffer:ckb offset:ck_off atIndex:5];
             [enc setBytes:&p length:sizeof(Params) atIndex:6];
+            [enc setBuffer:lb offset:lse_off atIndex:7];
             [enc dispatchThreadgroups:MTLSizeMake(q_tiles, (NSUInteger)num_seqs, (NSUInteger)H)
                 threadsPerThreadgroup:MTLSizeMake(cfg.tg_threads, 1, 1)];
             [enc endEncoding];
@@ -297,6 +310,77 @@ at::Tensor varlen_attention(
     });
 
     return out;
+}
+
+// Backward: returns (dQ, dK, dV). Inputs q,k,v,o,dout,lse must be contiguous.
+// dout = grad of out. lse = [total_q, H] fp32 from the forward (return_lse).
+std::tuple<at::Tensor, at::Tensor, at::Tensor> varlen_attention_bwd(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
+    const at::Tensor& o, const at::Tensor& dout, const at::Tensor& lse,
+    const at::Tensor& cu_seqlens_q, const at::Tensor& cu_seqlens_kv,
+    double scale, bool causal, int64_t window) {
+    const int64_t total_q = q.size(0), Hq = q.size(1), D = q.size(2);
+    const int64_t total_kv = k.size(0), Hkv = k.size(1);
+    auto cu_q = cu_seqlens_q.contiguous(), cu_kv = cu_seqlens_kv.contiguous();
+    const int64_t num_seqs = cu_q.numel() - 1;
+
+    auto dQ = at::empty_like(q), dK = at::empty_like(k), dV = at::empty_like(v);
+    auto delta = at::empty({total_q, Hq}, q.options().dtype(at::kFloat));
+
+    Params p{};
+    p.num_heads = (uint32_t)Hq; p.head_dim = (uint32_t)D; p.scale = (float)scale;
+    p.q_row_stride = (uint32_t)(Hq * D); p.k_row_stride = (uint32_t)(Hkv * D);
+    p.v_row_stride = (uint32_t)(Hkv * D); p.o_row_stride = (uint32_t)(Hq * D);
+    p.causal = causal ? 1u : 0u; p.gqa_group = (uint32_t)(Hq / Hkv);
+    p.window = (uint32_t)(window > 0 ? window : 0); p.return_lse = 0u;
+    p.num_seqs = (uint32_t)num_seqs;
+
+    const char* suf = q.scalar_type() == at::kHalf ? "half"
+                    : q.scalar_type() == at::kBFloat16 ? "bfloat" : "float";
+    auto& ctx = Context::instance();
+    id<MTLComputePipelineState> ps_delta = ctx.pipeline(std::string("bwd_delta_") + suf);
+    id<MTLComputePipelineState> ps_dq = ctx.pipeline(std::string("bwd_dq_") + suf);
+    id<MTLComputePipelineState> ps_dkv = ctx.pipeline(std::string("bwd_dkv_") + suf);
+
+    auto buf = [](const at::Tensor& t) { return at::native::mps::getMTLBufferStorage(t); };
+    id<MTLBuffer> qb=buf(q),kb=buf(k),vb=buf(v),ob=buf(o),dob=buf(dout),lb=buf(lse),
+                  db=buf(delta),dqb=buf(dQ),dkb=buf(dK),dvb=buf(dV),cqb=buf(cu_q),ckb=buf(cu_kv);
+    auto off = [](const at::Tensor& t) { return (NSUInteger)(t.storage_offset() * t.element_size()); };
+    NSUInteger qo=off(q),ko=off(k),vo=off(v),oo=off(o),doo=off(dout),lo=off(lse),
+               delo=off(delta),dqo=off(dQ),dko=off(dK),dvo=off(dV),cqo=off(cu_q),cko=off(cu_kv);
+
+    auto* stream = at::mps::getCurrentMPSStream();
+    mps_dispatch_sync(stream->queue(), ^() {
+        @autoreleasepool {
+            stream->endKernelCoalescing();
+            id<MTLComputeCommandEncoder> enc = [stream->commandBuffer() computeCommandEncoder];
+            // delta = rowsum(dO * O)
+            [enc setComputePipelineState:ps_delta];
+            [enc setBuffer:ob offset:oo atIndex:0]; [enc setBuffer:dob offset:doo atIndex:1];
+            [enc setBuffer:db offset:delo atIndex:2]; [enc setBytes:&p length:sizeof(Params) atIndex:3];
+            [enc dispatchThreads:MTLSizeMake(total_q, Hq, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            // dQ
+            [enc setComputePipelineState:ps_dq];
+            [enc setBuffer:qb offset:qo atIndex:0]; [enc setBuffer:kb offset:ko atIndex:1];
+            [enc setBuffer:vb offset:vo atIndex:2]; [enc setBuffer:dob offset:doo atIndex:3];
+            [enc setBuffer:lb offset:lo atIndex:4]; [enc setBuffer:db offset:delo atIndex:5];
+            [enc setBuffer:dqb offset:dqo atIndex:6]; [enc setBuffer:cqb offset:cqo atIndex:7];
+            [enc setBuffer:ckb offset:cko atIndex:8]; [enc setBytes:&p length:sizeof(Params) atIndex:9];
+            [enc dispatchThreads:MTLSizeMake(total_q, Hq, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            // dK, dV
+            [enc setComputePipelineState:ps_dkv];
+            [enc setBuffer:qb offset:qo atIndex:0]; [enc setBuffer:kb offset:ko atIndex:1];
+            [enc setBuffer:vb offset:vo atIndex:2]; [enc setBuffer:dob offset:doo atIndex:3];
+            [enc setBuffer:lb offset:lo atIndex:4]; [enc setBuffer:db offset:delo atIndex:5];
+            [enc setBuffer:dkb offset:dko atIndex:6]; [enc setBuffer:dvb offset:dvo atIndex:7];
+            [enc setBuffer:cqb offset:cqo atIndex:8]; [enc setBuffer:ckb offset:cko atIndex:9];
+            [enc setBytes:&p length:sizeof(Params) atIndex:10];
+            [enc dispatchThreads:MTLSizeMake(total_kv, Hkv, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            [enc endEncoding];
+        }
+    });
+    return {dQ, dK, dV};
 }
 
 }  // namespace
@@ -307,5 +391,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("q"), py::arg("k"), py::arg("v"),
           py::arg("cu_seqlens_q"), py::arg("cu_seqlens_kv"),
           py::arg("max_seqlen_q"), py::arg("scale"), py::arg("causal") = false,
-          py::arg("window") = 0);
+          py::arg("window") = 0, py::arg("lse_out") = c10::nullopt);
+    m.def("varlen_attention_bwd", &varlen_attention_bwd,
+          "Varlen attention backward (dQ, dK, dV)",
+          py::arg("q"), py::arg("k"), py::arg("v"), py::arg("o"), py::arg("dout"),
+          py::arg("lse"), py::arg("cu_seqlens_q"), py::arg("cu_seqlens_kv"),
+          py::arg("scale"), py::arg("causal") = false, py::arg("window") = 0);
 }

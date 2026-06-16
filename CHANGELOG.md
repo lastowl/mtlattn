@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- **Backward pass** — `varlen_attention` is now differentiable (a
+  `torch.autograd.Function` routes through new backward kernels when q/k/v
+  require grad), so it trains. Composes with causal / GQA/MQA / sliding-window
+  and varlen — variable-length training the MFA-based MPS kernels don't offer.
+  The forward emits log-sum-exp on demand for the backward to recompute P from.
+  The backward kernel is correct (validated vs autograd across the feature
+  matrix) but currently naive (one thread per output row) — a tiled version is
+  future work. Inference is unaffected (still the MPP path on M5).
+
 ## 0.1.0
 
 First release. Fused forward flash-attention for PyTorch/MPS on Apple Silicon.

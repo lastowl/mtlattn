@@ -162,6 +162,51 @@ def run_padding_case(name, B, H, N, D, Ls, dtype, atol, causal=False):
     return ok
 
 
+def run_bwd_case(name, q_lens, kv_lens, Hq, Hkv, D, dtype, atol, causal=False, window=0):
+    """Gradients from mtlattn's backward vs a differentiable per-sequence ref."""
+    torch.manual_seed(0)
+    g = Hq // Hkv
+    scale = 1.0 / math.sqrt(D)
+    Mq, Mk = sum(q_lens), sum(kv_lens)
+    q = torch.randn(Mq, Hq, D, dtype=dtype)
+    k = torch.randn(Mk, Hkv, D, dtype=dtype)
+    v = torch.randn(Mk, Hkv, D, dtype=dtype)
+    qm = q.to("mps").requires_grad_(); km = k.to("mps").requires_grad_(); vm = v.to("mps").requires_grad_()
+    out = mtlattn.varlen_attention(qm, km, vm, cu(q_lens), cu(kv_lens), max(q_lens),
+                                   causal=causal, window=window)
+    dO = torch.randn_like(out)
+    out.backward(dO)
+
+    # differentiable fp32 reference (kv heads expanded for GQA)
+    qr = q.float().requires_grad_()
+    kr = k.repeat_interleave(g, 1).float().requires_grad_()
+    vr = v.repeat_interleave(g, 1).float().requires_grad_()
+    outs, qo, ko = [], 0, 0
+    for ql, kl in zip(q_lens, kv_lens):
+        qi = qr[qo:qo + ql].permute(1, 0, 2)
+        ki = kr[ko:ko + kl].permute(1, 0, 2)
+        vi = vr[ko:ko + kl].permute(1, 0, 2)
+        a = (qi @ ki.transpose(-1, -2)) * scale
+        if causal or window:
+            i = torch.arange(ql)[:, None]; j = torch.arange(kl)[None, :]; coff = kl - ql
+            m = torch.ones(ql, kl, dtype=torch.bool)
+            if causal:
+                m &= (j <= i + coff)
+            if window:
+                m &= (j > i + coff - window)
+            a = a.masked_fill(~m, float("-inf"))
+        outs.append((a.softmax(-1) @ vi).permute(1, 0, 2)); qo += ql; ko += kl
+    torch.cat(outs, 0).backward(dO.cpu().float())
+    gk = kr.grad.view(Mk, Hkv, g, D).sum(2)   # fold expanded-head grads back
+    gv = vr.grad.view(Mk, Hkv, g, D).sum(2)
+    eq = (qm.grad.cpu().float() - qr.grad).abs().max().item()
+    ek = (km.grad.cpu().float() - gk).abs().max().item()
+    ev = (vm.grad.cpu().float() - gv).abs().max().item()
+    ok = max(eq, ek, ev) < atol
+    print(f"{name}: dQ={eq:.2e} dK={ek:.2e} dV={ev:.2e} (atol={atol}) {'OK' if ok else 'FAIL'}")
+    return ok
+
+
 def main():
     results = []
     # dtype -> tolerance (inputs are random N(0,1); fp16/bf16 storage rounding
@@ -203,6 +248,14 @@ def main():
     results.append(run_case("SWA w>=len (no-op)", [200], [200], 8, 128, torch.float16, 5e-3, causal=True, window=512))
     results.append(run_case("SWA non-causal band", [256], [256], 8, 128, torch.float16, 5e-3, causal=False, window=48))
     results.append(run_case("SWA D=64", [300, 40], [300, 40], 16, 64, torch.float16, 5e-3, causal=True, window=80))
+
+    # Backward pass (gradients) — full / causal / GQA / window / varlen / dtypes.
+    results.append(run_bwd_case("bwd full fp32", [256], [256], 8, 8, 128, torch.float32, 1e-4))
+    results.append(run_bwd_case("bwd causal fp32", [256], [256], 8, 8, 128, torch.float32, 1e-4, causal=True))
+    results.append(run_bwd_case("bwd GQA+causal", [256], [256], 8, 2, 128, torch.float32, 1e-4, causal=True))
+    results.append(run_bwd_case("bwd window", [512], [512], 8, 8, 128, torch.float32, 1e-4, causal=True, window=64))
+    results.append(run_bwd_case("bwd varlen GQA", [128, 300], [128, 300], 12, 4, 128, torch.float32, 1e-4, causal=True))
+    results.append(run_bwd_case("bwd fp16 causal", [256], [256], 8, 8, 128, torch.float16, 5e-3, causal=True))
 
     # The SDPA adapter cases go through torch's own MPS ops (permute/contiguous
     # -> a runtime-compiled transpose shader). Set MTLATTN_SKIP_SDPA to skip them

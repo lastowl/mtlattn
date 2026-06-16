@@ -30,6 +30,8 @@ struct Params {
     uint causal;        // 0 = full attention; 1 = causal mask
     uint gqa_group;     // query heads per kv head (1 = standard MHA)
     uint window;        // 0 = unlimited; >0 = attend last `window` keys (SWA)
+    uint return_lse;    // 1 = also write per-query log-sum-exp (for backward)
+    uint num_seqs;      // batch size (for the backward kernels' sequence lookup)
 };
 
 constant constexpr uint DMAX = 128;
@@ -47,6 +49,7 @@ void varlen_attn_impl(
     device const int* cu_q,
     device const int* cu_kv,
     constant Params& p,
+    device float* lse,          // [total_q, H] log-sum-exp, written if return_lse
     threadgroup T_f* Qs,        // [BQ * DMAX]; reused as O bounce
     threadgroup T_f* KsT,       // [DMAX * BK]  K transposed [D][BK]
     threadgroup T_f* Vs,        // [BK * DMAX]  V [BK][D]
@@ -232,6 +235,18 @@ void varlen_attn_impl(
         }
     }
 
+    // Log-sum-exp per query (over scaled scores; the softmax scale is folded
+    // into Q) — the backward pass recomputes P = exp(S - lse) from this.
+    if (p.return_lse) {
+        for (uint r = tid; r < BQ; r += TGS) {
+            if (int(r) < q_rows) {
+                const float l = l_run[r];
+                lse[ulong(q0 + int(r)) * p.num_heads + head] =
+                    (l > 0.0f) ? (m_run[r] + log(l)) : -INFINITY;
+            }
+        }
+    }
+
     // Store. The path choice must be threadgroup-uniform (barriers inside),
     // so it depends only on block-level facts.
     const bool direct_ok = DIRECT && (q_rows == int(BQ)) && (D % 8 == 0);
@@ -267,6 +282,7 @@ void varlen_attn_impl(
         device const int* cu_q [[buffer(4)]],                                 \
         device const int* cu_kv [[buffer(5)]],                                \
         constant Params& p [[buffer(6)]],                                     \
+        device float* lse [[buffer(7)]],                                      \
         uint3 tgid [[threadgroup_position_in_grid]],                          \
         uint tid [[thread_index_in_threadgroup]],                             \
         uint sgid [[simdgroup_index_in_threadgroup]],                         \
@@ -282,7 +298,7 @@ void varlen_attn_impl(
         threadgroup float l_run[8 * SGS];                                     \
         threadgroup float c_run[8 * SGS];                                     \
         varlen_attn_impl<T_IN, T_F, SGS, BK, DIRECT>(                         \
-            Q, K, V, O, cu_q, cu_kv, p, Qs, KsT, Vs, Ss, Ps, Diag,            \
+            Q, K, V, O, cu_q, cu_kv, p, lse, Qs, KsT, Vs, Ss, Ps, Diag,       \
             m_run, l_run, c_run, tgid, tid, sgid, lane);                      \
     }
 
@@ -300,3 +316,140 @@ void varlen_attn_impl(
 INSTANTIATE(varlen_attn_half, half, float, 4, 8, false)
 INSTANTIATE(varlen_attn_bfloat, bfloat, float, 4, 8, false)
 INSTANTIATE(varlen_attn_float, float, float, 4, 8, true)
+
+
+// ============================================================================
+// Backward pass (v0: correct-first, naive — one thread per output row).
+//
+// Recomputes S = scale*Q.K^T and P = exp(S - lse) from the stored LSE, so no
+// score matrix is materialised. Slower than a tiled kernel (no simdgroup_matrix
+// reuse), but straightforward to validate; a tiled version can replace it later.
+//   delta[i] = sum_d dO[i,d] * O[i,d]
+//   dV_j     = sum_i P_ij dO_i ;  dP_ij = dO_i.V_j ;  dS_ij = P_ij(dP_ij - delta_i)
+//   dQ_i     = scale sum_j dS_ij K_j ;  dK_j = scale sum_i dS_ij Q_i
+// Outputs dQ/dK/dV are contiguous: dQ row = H*D, dK/dV row = (H/gqa_group)*D.
+// ============================================================================
+
+static inline int bwd_find_seq(device const int* cu, uint nseq, int gidx) {
+    for (uint s = 0; s < nseq; ++s) if (gidx < cu[s + 1]) return int(s);
+    return int(nseq) - 1;
+}
+
+// delta[gq, h] = sum_d dO * O   (grid: total_q * H threads)
+template <typename T>
+inline void bwd_delta_impl(device const T* O, device const T* dO, device float* delta,
+                           constant Params& p, uint gq, uint h) {
+    const uint D = p.head_dim, H = p.num_heads;
+    const ulong base = ulong(gq) * p.o_row_stride + h * D;
+    float s = 0.0f;
+    for (uint d = 0; d < D; ++d) s += float(dO[base + d]) * float(O[base + d]);
+    delta[gq * H + h] = s;
+}
+
+// dQ[gq, h] = scale * sum_j dS_ij K_j     (grid: total_q * H threads)
+template <typename T>
+inline void bwd_dq_impl(device const T* Q, device const T* K, device const T* V,
+                        device const T* dO, device const float* lse, device const float* delta,
+                        device T* dQ, device const int* cu_q, device const int* cu_kv,
+                        constant Params& p, uint gq, uint h) {
+    const uint D = p.head_dim, H = p.num_heads;
+    const int s = bwd_find_seq(cu_q, p.num_seqs, int(gq));
+    const int q_start = cu_q[s], q_end = cu_q[s + 1];
+    const int kv_start = cu_kv[s], kv_len = cu_kv[s + 1] - kv_start;
+    const int qi = int(gq) - q_start;
+    const int coff = kv_len - (q_end - q_start);
+    const uint hk = h / p.gqa_group;
+    const float Li = lse[gq * H + h], di = delta[gq * H + h], scale = p.scale;
+    const ulong qbase = ulong(gq) * p.q_row_stride + h * D;
+    const ulong obase = ulong(gq) * p.o_row_stride + h * D;
+
+    float dq[DMAX];
+    for (uint d = 0; d < D; ++d) dq[d] = 0.0f;
+    const int hi = p.causal ? (qi + coff) : (kv_len - 1);
+    const int lo = (p.window > 0) ? max(0, qi + coff - int(p.window) + 1) : 0;
+    for (int j = lo; j <= hi && j < kv_len; ++j) {
+        const ulong kbase = ulong(kv_start + j) * p.k_row_stride + hk * D;
+        const ulong vbase = ulong(kv_start + j) * p.v_row_stride + hk * D;
+        float S = 0.0f, dP = 0.0f;
+        for (uint d = 0; d < D; ++d) {
+            S  += float(Q[qbase + d])  * float(K[kbase + d]);
+            dP += float(dO[obase + d]) * float(V[vbase + d]);
+        }
+        const float Pij = exp(S * scale - Li);
+        const float dS = Pij * (dP - di);
+        for (uint d = 0; d < D; ++d) dq[d] += scale * dS * float(K[kbase + d]);
+    }
+    const ulong dqbase = ulong(gq) * (H * D) + h * D;   // dQ contiguous
+    for (uint d = 0; d < D; ++d) dQ[dqbase + d] = T(dq[d]);
+}
+
+// dK[gk, hk], dV[gk, hk]     (grid: total_kv * H_kv threads)
+template <typename T>
+inline void bwd_dkv_impl(device const T* Q, device const T* K, device const T* V,
+                         device const T* dO, device const float* lse, device const float* delta,
+                         device T* dK, device T* dV, device const int* cu_q, device const int* cu_kv,
+                         constant Params& p, uint gk, uint hk) {
+    const uint D = p.head_dim, H = p.num_heads, g = p.gqa_group, Hkv = H / g;
+    const int s = bwd_find_seq(cu_kv, p.num_seqs, int(gk));
+    const int q_start = cu_q[s], q_len = cu_q[s + 1] - q_start;
+    const int kv_start = cu_kv[s], kv_len = cu_kv[s + 1] - kv_start;
+    const int kj = int(gk) - kv_start;
+    const int coff = kv_len - q_len;
+    const float scale = p.scale;
+    const ulong kbase = ulong(gk) * p.k_row_stride + hk * D;
+    const ulong vbase = ulong(gk) * p.v_row_stride + hk * D;
+
+    float dk[DMAX], dv[DMAX];
+    for (uint d = 0; d < D; ++d) { dk[d] = 0.0f; dv[d] = 0.0f; }
+    for (uint hh = hk * g; hh < (hk + 1) * g; ++hh) {       // query heads sharing this kv head
+        for (int i = 0; i < q_len; ++i) {
+            // mask: key kj seen by query i?  causal: kj <= i+coff ; window: kj > i+coff-window
+            if (p.causal && kj > i + coff) continue;
+            if (p.window > 0 && kj <= i + coff - int(p.window)) continue;
+            const uint gq = uint(q_start + i);
+            const ulong qbase = ulong(gq) * p.q_row_stride + hh * D;
+            const ulong obase = ulong(gq) * p.o_row_stride + hh * D;
+            const float Li = lse[gq * H + hh], di = delta[gq * H + hh];
+            float S = 0.0f, dP = 0.0f;
+            for (uint d = 0; d < D; ++d) {
+                S  += float(Q[qbase + d])  * float(K[kbase + d]);
+                dP += float(dO[obase + d]) * float(V[vbase + d]);
+            }
+            const float Pij = exp(S * scale - Li);
+            const float dS = Pij * (dP - di);
+            for (uint d = 0; d < D; ++d) {
+                dv[d] += Pij * float(dO[obase + d]);
+                dk[d] += scale * dS * float(Q[qbase + d]);
+            }
+        }
+    }
+    const ulong dkbase = ulong(gk) * (Hkv * D) + hk * D;    // dK/dV contiguous
+    for (uint d = 0; d < D; ++d) { dK[dkbase + d] = T(dk[d]); dV[dkbase + d] = T(dv[d]); }
+}
+
+#define INSTANTIATE_BWD(SUF, T)                                                          \
+    kernel void bwd_delta_##SUF(                                                         \
+        device const T* O [[buffer(0)]], device const T* dO [[buffer(1)]],              \
+        device float* delta [[buffer(2)]], constant Params& p [[buffer(3)]],            \
+        uint2 gid [[thread_position_in_grid]])                                          \
+    { bwd_delta_impl<T>(O, dO, delta, p, gid.x, gid.y); }                                \
+    kernel void bwd_dq_##SUF(                                                            \
+        device const T* Q [[buffer(0)]], device const T* K [[buffer(1)]],              \
+        device const T* V [[buffer(2)]], device const T* dO [[buffer(3)]],             \
+        device const float* lse [[buffer(4)]], device const float* delta [[buffer(5)]],\
+        device T* dQ [[buffer(6)]], device const int* cu_q [[buffer(7)]],              \
+        device const int* cu_kv [[buffer(8)]], constant Params& p [[buffer(9)]],       \
+        uint2 gid [[thread_position_in_grid]])                                          \
+    { bwd_dq_impl<T>(Q, K, V, dO, lse, delta, dQ, cu_q, cu_kv, p, gid.x, gid.y); }       \
+    kernel void bwd_dkv_##SUF(                                                           \
+        device const T* Q [[buffer(0)]], device const T* K [[buffer(1)]],              \
+        device const T* V [[buffer(2)]], device const T* dO [[buffer(3)]],             \
+        device const float* lse [[buffer(4)]], device const float* delta [[buffer(5)]],\
+        device T* dK [[buffer(6)]], device T* dV [[buffer(7)]],                         \
+        device const int* cu_q [[buffer(8)]], device const int* cu_kv [[buffer(9)]],    \
+        constant Params& p [[buffer(10)]], uint2 gid [[thread_position_in_grid]])       \
+    { bwd_dkv_impl<T>(Q, K, V, dO, lse, delta, dK, dV, cu_q, cu_kv, p, gid.x, gid.y); }
+
+INSTANTIATE_BWD(half, half)
+INSTANTIATE_BWD(bfloat, bfloat)
+INSTANTIATE_BWD(float, float)

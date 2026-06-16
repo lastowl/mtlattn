@@ -1,5 +1,5 @@
 """
-mtlattn: fused variable-length attention (forward only) for Apple Silicon.
+mtlattn: fused variable-length attention (forward + backward) for Apple Silicon.
 
 Drop-in equivalents for the flash_attn varlen entry points used by
 TRELLIS.2-family sparse transformers, running on PyTorch MPS tensors with no
@@ -22,6 +22,28 @@ __all__ = [
 ]
 
 
+class _VarlenAttnFn(torch.autograd.Function):
+    """Differentiable varlen attention. Forward requests the LSE (forces the
+    simdgroup path) and saves it; backward returns dQ, dK, dV."""
+
+    @staticmethod
+    def forward(ctx, q, k, v, cu_q, cu_kv, max_q, scale, causal, window):
+        lse = torch.empty(q.shape[0], q.shape[1], dtype=torch.float32, device=q.device)
+        out = _C.varlen_attention(q, k, v, cu_q, cu_kv, max_q, scale, causal, window, lse)
+        ctx.save_for_backward(q, k, v, out, lse, cu_q, cu_kv)
+        ctx.scale, ctx.causal, ctx.window = scale, causal, window
+        return out
+
+    @staticmethod
+    def backward(ctx, dout):
+        q, k, v, out, lse, cu_q, cu_kv = ctx.saved_tensors
+        dQ, dK, dV = _C.varlen_attention_bwd(
+            q.contiguous(), k.contiguous(), v.contiguous(),
+            out.contiguous(), dout.contiguous(), lse, cu_q, cu_kv,
+            ctx.scale, ctx.causal, ctx.window)
+        return dQ, dK, dV, None, None, None, None, None, None
+
+
 def varlen_attention(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, scale=None,
                      causal=False, window=0):
     """q, k, v: [M, H, D] MPS tensors (row-strided views OK).
@@ -29,13 +51,18 @@ def varlen_attention(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, scale=N
     causal: if True, query i attends key j iff j <= i + (kv_len - q_len).
     window: if >0, sliding window — query i attends only its last `window`
         keys (relative to the causal diagonal). Mistral-style SWA is
-        causal=True with window=W."""
+        causal=True with window=W.
+
+    Differentiable: if any of q/k/v requires grad, routes through the backward
+    kernel (training). Otherwise uses the fast inference path (MPP on M5)."""
     if scale is None:
         scale = 1.0 / math.sqrt(q.shape[-1])
+    cu_q, cu_kv = cu_seqlens_q.int(), cu_seqlens_kv.int()
+    if torch.is_grad_enabled() and (q.requires_grad or k.requires_grad or v.requires_grad):
+        return _VarlenAttnFn.apply(q, k, v, cu_q, cu_kv, int(max_seqlen_q),
+                                   float(scale), bool(causal), int(window))
     return _C.varlen_attention(
-        q, k, v,
-        cu_seqlens_q.int(), cu_seqlens_kv.int(),
-        int(max_seqlen_q), float(scale), bool(causal), int(window),
+        q, k, v, cu_q, cu_kv, int(max_seqlen_q), float(scale), bool(causal), int(window),
     )
 
 
