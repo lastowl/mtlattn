@@ -77,7 +77,8 @@ def _window_from_kwargs(window, kwargs):
 
 def flash_attn_varlen_qkvpacked_func(qkv, cu_seqlens, max_seqlen, softmax_scale=None,
                                      causal=False, window=0, **kwargs):
-    """qkv: [M, 3, H, D]. Mirrors flash_attn's API (forward only)."""
+    """qkv: [M, 3, H, D]. Mirrors flash_attn's API; differentiable (routes
+    through varlen_attention's autograd, so qkv.grad flows)."""
     q, k, v = qkv.unbind(dim=1)  # row-strided views; kernel supports them
     return varlen_attention(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, softmax_scale,
                             causal=causal, window=_window_from_kwargs(window, kwargs))
@@ -87,7 +88,7 @@ def flash_attn_varlen_kvpacked_func(
     q, kv, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
     softmax_scale=None, causal=False, window=0, **kwargs,
 ):
-    """q: [Mq, H, D]; kv: [Mkv, 2, H, D]. Mirrors flash_attn's API (forward only)."""
+    """q: [Mq, H, D]; kv: [Mkv, 2, H, D]. Mirrors flash_attn's API; differentiable."""
     k, v = kv.unbind(dim=1)
     return varlen_attention(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, softmax_scale,
                             causal=causal, window=_window_from_kwargs(window, kwargs))

@@ -95,7 +95,7 @@ out = mtlattn.varlen_attention(q, k, v, cu_seqlens_q, cu_seqlens_kv,
 # with window=W. The kernel jumps straight to each block's window band, so
 # cost is O(W) not O(seqlen): ~7-14x faster than full at long sequences.
 
-# flash_attn-compatible wrappers (forward only):
+# flash_attn-compatible wrappers (differentiable — forward + backward):
 out = mtlattn.flash_attn_varlen_qkvpacked_func(qkv, cu_seqlens, max_seqlen)
 out = mtlattn.flash_attn_varlen_kvpacked_func(q, kv, cu_q, cu_k, max_q, max_k)
 ```
@@ -147,7 +147,7 @@ mtlattn.replace_sdpa()        # patch F.scaled_dot_product_attention (inference)
 ```
 
 **Already using `flash_attn`.** The varlen entry points are signature-compatible
-(forward only), so it's an import swap:
+and differentiable (forward + backward), so it's an import swap:
 
 ```python
 # from flash_attn import flash_attn_varlen_qkvpacked_func
