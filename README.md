@@ -217,6 +217,13 @@ python -m mtlattn.bench --paths both --vs-sdpa --causal   # MPP, simdgroup, nati
 python -m mtlattn.bench --sizes 8192 --causal --window 256
 ```
 
+> **Benchmarking caveat:** Apple-Silicon GPU clocks are load-state-dependent —
+> a cold call after idle can read ~¼ of the warmed number, and short bursts
+> understate sustained large-N throughput. Warm up and take a median. Full
+> measured ceilings, what bounds each kernel, the tuning constants, and the
+> known dead-ends (levers that are API-blocked or lose to occupancy) are in
+> [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
+
 ## Correctness
 
 `python tests/test_correctness.py` — 34 cases vs a per-sequence fp32
