@@ -164,22 +164,59 @@ handling is fiddly).
   `compile_shader`, monkey-patches `torch._scaled_mm`); its fused kernel runs
   **~4–26× slower than fp16**. Useful for memory/compat, never for speed.
 
-**Takeaway:** the lower-precision path to ~2× is **int8 quantization, not fp8** —
-available today, native, confirmed 2× at the matmul level. The open work is the
-*accuracy* side: quantizing Q/K/V (and P for PV) with per-row/block scales, where
-activation outliers (the same ones that force fp32 accumulators here) make
-attention harder to quantize than weights. int4 is a further ~2× if accuracy holds.
+**Takeaway:** int8 is a real 2× *at the matmul level*, but on *attention* it caps
+at a **~1.3× ceiling** and isn't worth the machinery right now — built, measured,
+and **parked** (see below).
+
+## Parked: int8-quantized attention (built, benchmarked, ~1.3× ceiling)
+
+Implemented and benchmarked an int8 forward on `matmul2d` (code on branch
+`experiments/int8-attention`). It is **correct** (0.7% error, group=32 even
+handles ×300 outlier channels) and — *after optimization* — **~1.2–1.3× slower**
+than fp16, with a best-possible ceiling of only ~1.3× *faster*. The journey is the
+lesson:
+
+| stage | g32 (robust acc) | g128 (per-row, 1 matmul) |
+|---|---|---|
+| naive prototype | 0.15× (6× slower) | 0.17× |
+| − per-q-tile K re-staging (device-direct read) | 0.43× | 0.57× |
+| + parallel (LPR) softmax | 0.55× | **0.81× (1.23× slower)** |
+
+What this established (and corrected):
+- **The first "6× slower → it's the 4 matmuls" reading was WRONG.** A diagnostic
+  (group=128 = a *single* K=128 matmul) was still 5× slower, so the matmul *count*
+  was not the wall. The real cost was **occupancy collapse** (the int8 kernel's
+  threadgroup footprint — staged K + int32 scratch + fp32 O — is ~2× the fp16
+  kernel's, and this family is occupancy-bound) plus **serial overhead** (one
+  thread/row softmax, a per-tile K-staging copy). Removing the staging (read the
+  pre-quantized K device-direct) and parallelizing the softmax closed most of the
+  gap. *Lesson: never conclude perf from an unoptimized kernel.*
+- The **ceiling is ~1.3× faster** regardless: int8 only accelerates the QK matmul
+  (≈ half the FLOPs); PV stays fp16 (SageAttention-v1 — quantizing P/V was a net
+  loss). Folding the int32→fp32 dequant into the softmax *regressed* (it moves the
+  device K-scale read into the hot loop) — the separate pass to threadgroup is
+  better.
+- Accuracy needs **group=32** for robustness — a single per-row scale is 13% off on
+  ×300 outlier channels (group=32: 0.0001). The faster **per-row (g128)** path
+  needs **Hadamard rotation** (QuaRot/FA3) for accuracy on real multiplicative
+  outliers (smooth-K handles only mean-offset ones). So the fast path has *two*
+  unfinished problems (close the last ~1.3× of speed AND add Hadamard).
+
+Net: a real but modest ~1.3× best case, needing more occupancy work + Hadamard, on
+an fp16 path already at ~73% of its ceiling. Parked on the branch; revisit if fp16
+is exhausted or hardware changes. fp8/int4 don't rescue it: fp8 isn't a native
+operand until macOS 27, int4 has no native `matmul2d` operand (unpack-to-int8 costs
+ALU). Prior art agrees on the magnitude — SageAttention/Draw Things realize only
+~1.2–1.4×, *with* smoothing/rotation machinery.
 
 ## Remaining headroom (all large/uncertain)
 
-1. **int8-quantized attention** — the largest measured lever (native 2× on the M5
-   NA; helps forward *and* backward). Needs Q/K/V quantization with scales and an
-   accuracy validation pass; activation outliers are the risk. int4 doubles it
-   again if accuracy survives. fp8 deferred to macOS 27 (see above).
-2. **Manual register-resident softmax** (cooperative-tensor scores + hand-rolled
+1. **Manual register-resident softmax** (cooperative-tensor scores + hand-rolled
    cross-simdgroup reduction, since `reduce_rows` is out) — could shave the
    forward's threadgroup round-trip, but high occupancy/correctness risk.
-3. **One-pass fused backward** — major rewrite, uncertain payoff.
+2. **One-pass fused backward** — major rewrite, uncertain payoff.
+3. **int8 (Hadamard-rotated per-row QK + more occupancy work)** — ~1.3× ceiling,
+   parked on `experiments/int8-attention`; revisit only if fp16 is exhausted.
 
 Otherwise: the kernels are near their practical limits for the
 `matmul2d`-with-threadgroup structure on current hardware. The easy wins are gone.
