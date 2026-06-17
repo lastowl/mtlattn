@@ -1,9 +1,9 @@
 name: wheels
 
 # Build Apple-Silicon wheels. Run manually (Actions tab -> Run workflow) or on a
-# version tag. Publishing to PyPI is intentionally NOT wired up (needs a
-# PYPI_API_TOKEN secret) — wheels are uploaded as build artifacts you can
-# download or attach to a GitHub release.
+# version tag. On a v* tag the wheels are also published to PyPI via Trusted
+# Publishing (OIDC, no token — see the `publish` job); a manual run only uploads
+# them as downloadable build artifacts.
 on:
   workflow_dispatch:
   push:

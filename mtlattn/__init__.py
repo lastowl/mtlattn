@@ -23,15 +23,17 @@ __all__ = [
 
 
 class _VarlenAttnFn(torch.autograd.Function):
-    """Differentiable varlen attention. Forward requests the LSE (forces the
-    simdgroup path) and saves it; backward returns dQ, dK, dV."""
+    """Differentiable varlen attention. Forward requests the LSE and saves it;
+    backward returns dQ, dK, dV. `bias` (optional additive attn_mask) is treated
+    as a constant — it is applied in both forward and backward but not
+    differentiated (no dbias)."""
 
     @staticmethod
-    def forward(ctx, q, k, v, cu_q, cu_kv, max_q, scale, causal, window):
+    def forward(ctx, q, k, v, cu_q, cu_kv, max_q, scale, causal, window, bias):
         lse = torch.empty(q.shape[0], q.shape[1], dtype=torch.float32, device=q.device)
-        out = _C.varlen_attention(q, k, v, cu_q, cu_kv, max_q, scale, causal, window, lse)
+        out = _C.varlen_attention(q, k, v, cu_q, cu_kv, max_q, scale, causal, window, lse, bias)
         ctx.save_for_backward(q, k, v, out, lse, cu_q, cu_kv)
-        ctx.scale, ctx.causal, ctx.window = scale, causal, window
+        ctx.scale, ctx.causal, ctx.window, ctx.bias = scale, causal, window, bias
         return out
 
     @staticmethod
@@ -40,29 +42,53 @@ class _VarlenAttnFn(torch.autograd.Function):
         dQ, dK, dV = _C.varlen_attention_bwd(
             q.contiguous(), k.contiguous(), v.contiguous(),
             out.contiguous(), dout.contiguous(), lse, cu_q, cu_kv,
-            ctx.scale, ctx.causal, ctx.window)
-        return dQ, dK, dV, None, None, None, None, None, None
+            ctx.scale, ctx.causal, ctx.window, ctx.bias)
+        return dQ, dK, dV, None, None, None, None, None, None, None
+
+
+def _prep_bias(attn_bias):
+    """Normalize an additive bias to the kernel's contract: fp32, last-dim
+    contiguous. Raises if it requires grad (a differentiable mask is unsupported;
+    the bias is applied but not differentiated)."""
+    if attn_bias is None:
+        return None
+    if attn_bias.requires_grad:
+        raise NotImplementedError(
+            "mtlattn: a differentiable attn_bias (requires_grad=True) is not supported; "
+            "detach it or treat the mask as constant")
+    if attn_bias.dtype != torch.float32:
+        attn_bias = attn_bias.to(torch.float32)
+    if attn_bias.dim() != 3 or attn_bias.stride(-1) != 1:
+        attn_bias = attn_bias.contiguous()
+    return attn_bias
 
 
 def varlen_attention(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, scale=None,
-                     causal=False, window=0):
+                     causal=False, window=0, attn_bias=None):
     """q, k, v: [M, H, D] MPS tensors (row-strided views OK).
     cu_seqlens_*: int32 [B+1] on MPS. Returns [Mq, H, D].
     causal: if True, query i attends key j iff j <= i + (kv_len - q_len).
     window: if >0, sliding window — query i attends only its last `window`
         keys (relative to the causal diagonal). Mistral-style SWA is
         causal=True with window=W.
+    attn_bias: optional additive mask [total_q, H or 1, max_kv] fp32, added to
+        the logits before softmax (logit = scale*(q·k) + bias). dim1==1
+        broadcasts across heads. Indexed by global query row and seq-local key.
+        MPP-only (macOS 26.2+, fp16/bf16, head_dim 64/96/128/256); raises on the
+        simdgroup fallback. Applied but not differentiated.
 
     Differentiable: if any of q/k/v requires grad, routes through the backward
     kernel (training). Otherwise uses the fast inference path (MPP on M5)."""
     if scale is None:
         scale = 1.0 / math.sqrt(q.shape[-1])
     cu_q, cu_kv = cu_seqlens_q.int(), cu_seqlens_kv.int()
+    bias = _prep_bias(attn_bias)
     if torch.is_grad_enabled() and (q.requires_grad or k.requires_grad or v.requires_grad):
         return _VarlenAttnFn.apply(q, k, v, cu_q, cu_kv, int(max_seqlen_q),
-                                   float(scale), bool(causal), int(window))
+                                   float(scale), bool(causal), int(window), bias)
     return _C.varlen_attention(
         q, k, v, cu_q, cu_kv, int(max_seqlen_q), float(scale), bool(causal), int(window),
+        None, bias,
     )
 
 
@@ -103,10 +129,42 @@ _ORIG_SDPA = None
 _SDPA_MIN_SEQLEN = 1024
 
 
+def _sdpa_mask_to_bias(attn_mask, B, Hq, Nq, Nkv):
+    """Convert a dense SDPA attn_mask to the varlen additive-bias layout
+    [B*Nq, H or 1, Nkv] fp32. Accepts a [Nq,Nkv] or broadcastable [b,h,Nq,Nkv]
+    mask, bool (True=keep -> 0, False -> -inf) or float (already additive). Keeps
+    the head dim at 1 when the mask is head-broadcast (the kernel reads it with a
+    zero head stride). Raises NotImplementedError for shapes it can't map."""
+    m = attn_mask
+    if m.dim() == 2:                       # [Nq, Nkv]
+        m = m.view(1, 1, Nq, Nkv)
+    elif m.dim() == 4:                     # [b in {1,B}, h in {1,Hq}, Nq, Nkv]
+        if m.shape[2] != Nq or m.shape[3] != Nkv:
+            raise NotImplementedError("mtlattn: attn_mask query/key dims must match")
+    else:
+        raise NotImplementedError("mtlattn: attn_mask must be 2D or 4D")
+    if m.dtype == torch.bool:
+        m = torch.zeros(m.shape, dtype=torch.float32, device=m.device).masked_fill_(
+            ~m, float("-inf"))
+    else:
+        m = m.to(torch.float32)
+    b, h = m.shape[0], m.shape[1]
+    if b == 1 and B > 1:
+        m = m.expand(B, h, Nq, Nkv)
+    elif b != B:
+        raise NotImplementedError("mtlattn: attn_mask batch dim must be 1 or B")
+    if h != 1 and h != Hq:
+        raise NotImplementedError("mtlattn: attn_mask head dim must be 1 or num_heads")
+    # [B, h, Nq, Nkv] -> [B, Nq, h, Nkv] -> [B*Nq, h, Nkv] (last dim contiguous)
+    return m.permute(0, 2, 1, 3).contiguous().reshape(B * Nq, h, Nkv)
+
+
 def sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None):
     """Dense [B, H, N, D] scaled_dot_product_attention backed by mtlattn's
     varlen kernel (equal-length batch -> trivial cu_seqlens). Forward only.
-    Supports GQA (kv heads < q heads). attn_mask/dropout are not supported."""
+    Supports GQA (kv heads < q heads). An attn_mask (bool or additive float,
+    [Nq,Nkv] or broadcastable [B,H,Nq,Nkv]) is applied as an additive bias
+    (MPP-only). dropout is not supported."""
     B, Hq, Nq, D = query.shape
     Hkv, Nkv = key.shape[1], key.shape[2]
     if scale is None:
@@ -118,7 +176,8 @@ def sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scal
     v = value.permute(0, 2, 1, 3).contiguous().view(B * Nkv, Hkv, D)
     cu_q = torch.arange(0, (B + 1) * Nq, Nq, dtype=torch.int32, device=query.device)
     cu_kv = torch.arange(0, (B + 1) * Nkv, Nkv, dtype=torch.int32, device=query.device)
-    out = varlen_attention(q, k, v, cu_q, cu_kv, Nq, scale, causal=is_causal)
+    bias = _sdpa_mask_to_bias(attn_mask, B, Hq, Nq, Nkv) if attn_mask is not None else None
+    out = varlen_attention(q, k, v, cu_q, cu_kv, Nq, scale, causal=is_causal, attn_bias=bias)
     return out.reshape(B, Nq, Hq, D).permute(0, 2, 1, 3).contiguous()
 
 
@@ -215,6 +274,13 @@ def replace_sdpa(min_seqlen=_SDPA_MIN_SEQLEN):
                 r = _try_padding_varlen(query, key, value, attn_mask, is_causal, sc)
                 if r is not None:
                     return r
+                # General additive/bool mask -> additive-bias path (MPP-only).
+                # Falls back to native SDPA if MPP is unavailable or the mask
+                # shape can't be mapped to the varlen bias layout.
+                try:
+                    return sdpa(query, key, value, attn_mask, dropout_p, is_causal, scale)
+                except (NotImplementedError, RuntimeError):
+                    pass
         return orig(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p,
                     is_causal=is_causal, scale=scale, **kwargs)
 

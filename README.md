@@ -5,7 +5,8 @@ compute kernel for PyTorch MPS tensors, with online softmax, fp32 accumulation,
 **no padding and no materialized `[L, L]` score matrix**.
 
 Variable-length (`cu_seqlens`) attention is the core; it also does **causal
-masking, GQA/MQA, and sliding-window** attention, and ships a
+masking, GQA/MQA, sliding-window, and arbitrary additive attention bias**
+(prefix-LM / ALiBi / custom masks), and ships a
 `scaled_dot_product_attention` drop-in so existing models use it unchanged.
 
 - **Two runtime paths, selected automatically**: the Metal 4 `matmul2d`
@@ -95,6 +96,16 @@ out = mtlattn.varlen_attention(q, k, v, cu_seqlens_q, cu_seqlens_kv,
 # with window=W. The kernel jumps straight to each block's window band, so
 # cost is O(W) not O(seqlen): ~7-14x faster than full at long sequences.
 
+# attn_bias=B: arbitrary ADDITIVE mask, [total_q, H or 1, max_kv] fp32, added to
+# the logits before softmax (logit = scale*(q·k) + bias). dim1==1 broadcasts
+# across heads. Use it for prefix-LM, ALiBi, custom/soft patterns — anything not
+# expressible as causal/window. Indexed by global query row and seq-local key;
+# composes with causal/window/GQA. Applied in forward AND backward (the bias is
+# treated as constant — a grad-requiring bias raises). MPP-only (macOS 26.2+,
+# fp16/bf16, head_dim 64/96/128/256); a bool mask becomes 0 / -inf additive.
+out = mtlattn.varlen_attention(q, k, v, cu_seqlens_q, cu_seqlens_kv,
+                               max_seqlen_q, attn_bias=B)
+
 # flash_attn-compatible wrappers (differentiable — forward + backward):
 out = mtlattn.flash_attn_varlen_qkvpacked_func(qkv, cu_seqlens, max_seqlen)
 out = mtlattn.flash_attn_varlen_kvpacked_func(q, kv, cu_q, cu_k, max_q, max_k)
@@ -115,13 +126,13 @@ wins — long/ragged sequences, and the cases native MPS SDPA pads, OOMs, or hit
 the `>2^32` MPSGraph bug on — and falls back to native SDPA otherwise (small
 shapes, autograd/training, unsupported dtype/head_dim). A self-attention
 **key-padding `attn_mask`** is converted to varlen (the valid tokens are packed
-and the padding is skipped, not just masked); any other `attn_mask` falls back.
-The crossover length is `replace_sdpa(min_seqlen=...)`. `mtlattn.sdpa(...)` is
-the same adapter callable directly.
-
-(Arbitrary per-position `attn_mask` support in the kernel itself — prefix-LM,
-custom patterns — is on the roadmap; today only padding/causal/window are
-accelerated.)
+and the padding is skipped, not just masked). Any **other `attn_mask`** (a
+general bool or additive-float mask, `[Nq,Nkv]` or broadcastable `[B,H,Nq,Nkv]`)
+is applied as an **additive bias** on the kernel's MPP path — prefix-LM, ALiBi,
+custom/soft patterns all work — and falls back to native SDPA only if MPP is
+unavailable or the mask shape can't be mapped. The crossover length is
+`replace_sdpa(min_seqlen=...)`. `mtlattn.sdpa(...)` is the same adapter callable
+directly.
 
 **head_dim**: 64/96/128/256 run on the accelerator (MPP) path; any other
 `head_dim ≤ 128` runs on the portable simdgroup kernel; `head_dim` 256 needs the

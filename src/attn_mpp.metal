@@ -3,6 +3,16 @@
 using namespace metal;
 using namespace mpp::tensor_ops;
 
+// Optional arbitrary additive attention bias. Specialized per-pipeline at build
+// time so the (overwhelmingly common) no-bias kernels are dead-branch-eliminated
+// — they keep their original register footprint, which matters because the
+// forward is occupancy-bound and register-sensitive (a runtime flag would
+// pressure occupancy even when bias is off). The bias is added to the logit
+// before softmax: logit = scale*(Q·K) + bias[q, head, key]. See the host
+// (try_mpp_varlen) for the buffer layout and stride convention.
+constant bool HAS_BIAS [[function_constant(0)]];
+constexpr constant float MPP_LOG2E = 1.4426950408889634f;  // log2(e)
+
 // Single-tile fused attention (one threadgroup, L<=TN keys, one sequence):
 //   S = (Q @ K^T) * scale ; P = softmax(S) ; O = P @ V
 // QK via matmul2d transpose_right; softmax in threadgroup; PV via matmul2d.
@@ -170,6 +180,7 @@ inline void attn_vl(device const T* Q, device const T* K, device const T* V, dev
                     device const int* cu_q, device const int* cu_kv, uint H, float scale,
                     uint q_rs, uint k_rs, uint v_rs, uint causal, uint g, uint window,
                     device float* lse, uint return_lse,
+                    device const float* bias, uint bias_qs, uint bias_hs,
                     threadgroup float* Sb, threadgroup T* Pb,
                     threadgroup float* Ob, threadgroup float* mb, threadgroup float* lb, threadgroup float* cb,
                     uint tid, uint qtile, uint seq, uint head)
@@ -238,20 +249,42 @@ inline void attn_vl(device const T* Q, device const T* K, device const T* V, dev
             int lo = 0;
             if (window > 0) { int dl = (q0 - q_start) + int(row) + coff - int(window) + 1 - kvbase; lo = clamp(dl, 0, lim); }
             const float m_old = mb[row];
-            // max(S*scl) == scl*max(S) for scl>0, so scan raw scores and scale
-            // the reduced max once (saves a multiply per key in the hot scan).
-            float rawmax = -INFINITY;
-            for (uint c = sub; c < uint(TN); c += LPR)
-                if (int(c) >= lo && int(c) < lim) rawmax = max(rawmax, Sb[row*TN+c]);
-            for (uint o = 1; o < LPR; o <<= 1) rawmax = max(rawmax, simd_shuffle_xor(rawmax, o));
-            const float tmax = (rawmax == -INFINITY) ? m_old : max(m_old, rawmax * scl);
-            // tmax stays -inf when this tile has no keys for the row (windowed
-            // band skips it); rescale is then a no-op (1), not exp2(-inf+inf)=NaN.
-            const float corr = (tmax == -INFINITY) ? 1.0f : exp2(m_old - tmax);
-            float tsum = 0.0f;
-            for (uint c = sub; c < uint(TN); c += LPR) {
-                float w = ((int(c) >= lo) && (int(c) < lim)) ? exp2(Sb[row*TN+c]*scl - tmax) : 0.0f;
-                tsum += w; Pb[row*TN+c] = T(w);
+            float tmax, corr, tsum = 0.0f;
+            if (!HAS_BIAS) {
+                // max(S*scl) == scl*max(S) for scl>0, so scan raw scores and scale
+                // the reduced max once (saves a multiply per key in the hot scan).
+                float rawmax = -INFINITY;
+                for (uint c = sub; c < uint(TN); c += LPR)
+                    if (int(c) >= lo && int(c) < lim) rawmax = max(rawmax, Sb[row*TN+c]);
+                for (uint o = 1; o < LPR; o <<= 1) rawmax = max(rawmax, simd_shuffle_xor(rawmax, o));
+                tmax = (rawmax == -INFINITY) ? m_old : max(m_old, rawmax * scl);
+                // tmax stays -inf when this tile has no keys for the row (windowed
+                // band skips it); rescale is then a no-op (1), not exp2(-inf+inf)=NaN.
+                corr = (tmax == -INFINITY) ? 1.0f : exp2(m_old - tmax);
+                for (uint c = sub; c < uint(TN); c += LPR) {
+                    float w = ((int(c) >= lo) && (int(c) < lim)) ? exp2(Sb[row*TN+c]*scl - tmax) : 0.0f;
+                    tsum += w; Pb[row*TN+c] = T(w);
+                }
+            } else {
+                // Additive bias breaks the raw-max trick (the per-element logit is
+                // S*scl + bias*log2e, not a uniform scaling of S), so reduce the
+                // max over the full logit. bias is indexed by global query row,
+                // head, and seq-local key (kvbase + c). mb/lse stay in base-2 units
+                // and the resulting LSE correctly includes the bias, so the backward
+                // just adds +bias in its P recompute.
+                const ulong bb = ulong(q0 + int(row)) * bias_qs + ulong(head) * bias_hs + ulong(kvbase);
+                float l2max = -INFINITY;
+                for (uint c = sub; c < uint(TN); c += LPR)
+                    if (int(c) >= lo && int(c) < lim)
+                        l2max = max(l2max, Sb[row*TN+c]*scl + bias[bb + c]*MPP_LOG2E);
+                for (uint o = 1; o < LPR; o <<= 1) l2max = max(l2max, simd_shuffle_xor(l2max, o));
+                tmax = (l2max == -INFINITY) ? m_old : max(m_old, l2max);
+                corr = (tmax == -INFINITY) ? 1.0f : exp2(m_old - tmax);
+                for (uint c = sub; c < uint(TN); c += LPR) {
+                    float w = ((int(c) >= lo) && (int(c) < lim))
+                                ? exp2(Sb[row*TN+c]*scl + bias[bb + c]*MPP_LOG2E - tmax) : 0.0f;
+                    tsum += w; Pb[row*TN+c] = T(w);
+                }
             }
             for (uint o = 1; o < LPR; o <<= 1) tsum += simd_shuffle_xor(tsum, o);
             if (sub == 0) { mb[row] = tmax; lb[row] = lb[row]*corr + tsum; cb[row] = corr; }
@@ -296,13 +329,15 @@ kernel void NAME(                                                               
     constant uint& causal [[buffer(11)]], constant uint& g [[buffer(12)]],      \
     constant uint& window [[buffer(13)]],                                       \
     device float* lse [[buffer(14)]], constant uint& return_lse [[buffer(15)]], \
+    device const float* bias [[buffer(16)]],                                    \
+    constant uint& bias_qs [[buffer(17)]], constant uint& bias_hs [[buffer(18)]], \
     uint tid [[thread_index_in_threadgroup]], uint3 tgid [[threadgroup_position_in_grid]]) \
 {                                                                               \
     constexpr int TM=TM_,TN=48,D=D_,SG=4;                                       \
     threadgroup float Sb[TM*TN]; threadgroup T Pb[TM*TN];                       \
     threadgroup float Ob[TM*D];                                                 \
     threadgroup float mb[TM], lb[TM], cb[TM];                                   \
-    attn_vl<T,TM,TN,D,SG>(Q,K,V,O,cu_q,cu_kv,H,scale,q_rs,k_rs,v_rs,causal,g,window,lse,return_lse,Sb,Pb,Ob,mb,lb,cb,tid,tgid.x,tgid.y,tgid.z); \
+    attn_vl<T,TM,TN,D,SG>(Q,K,V,O,cu_q,cu_kv,H,scale,q_rs,k_rs,v_rs,causal,g,window,lse,return_lse,bias,bias_qs,bias_hs,Sb,Pb,Ob,mb,lb,cb,tid,tgid.x,tgid.y,tgid.z); \
 }
 // matmul2d is dimension-general, so the same kernel serves any head_dim. We
 // instantiate the common dims: 64/96/128 (cover ~all transformers) get both TM
@@ -338,6 +373,7 @@ inline void bwd_dkv_mpp(device const T* Q, device const T* K, device const T* V,
                         device float* dK, device float* dV,
                         device const int* cu_q, device const int* cu_kv,
                         uint H, float scale, uint g, uint causal, uint window,
+                        device const float* bias, uint bias_qs, uint bias_hs,
                         threadgroup float* Sb, threadgroup T* Pb,
                         threadgroup float* dKb, threadgroup float* dVb,
                         uint tid, uint ktile, uint seq, uint kvhead)
@@ -393,7 +429,11 @@ inline void bwd_dkv_mpp(device const T* Q, device const T* K, device const T* V,
                     bool keep = true;
                     if (causal) keep = jl <= il + coff;
                     if (keep && window > 0) keep = jl > il + coff - int(window);
-                    if (keep) w = exp(scale * Sb[e] - lse[ulong(q0 + int(r)) * H + hh]);
+                    if (keep) {
+                        float lg = scale * Sb[e] - lse[ulong(q0 + int(r)) * H + hh];
+                        if (HAS_BIAS) lg += bias[ulong(q0 + int(r)) * bias_qs + ulong(hh) * bias_hs + ulong(jl)];
+                        w = exp(lg);
+                    }
                 }
                 Pb[e] = T(w);
             }
@@ -438,12 +478,14 @@ kernel void NAME(                                                               
     device const int* cu_q [[buffer(8)]], device const int* cu_kv [[buffer(9)]], \
     constant uint& H [[buffer(10)]], constant float& scale [[buffer(11)]],      \
     constant uint& g [[buffer(12)]], constant uint& causal [[buffer(13)]], constant uint& window [[buffer(14)]], \
+    device const float* bias [[buffer(15)]],                                    \
+    constant uint& bias_qs [[buffer(16)]], constant uint& bias_hs [[buffer(17)]], \
     uint tid [[thread_index_in_threadgroup]], uint3 tgid [[threadgroup_position_in_grid]]) \
 {                                                                               \
     constexpr int BQ_=BQ, BK_=BK, D=D_, SG=4;                                   \
     threadgroup float Sb[BQ_*BK_]; threadgroup T Pb[BQ_*BK_];                    \
     threadgroup float dKb[BK_*D]; threadgroup float dVb[BK_*D];                  \
-    bwd_dkv_mpp<T,BQ_,BK_,D,SG>(Q,K,V,dO,lse,delta,dK,dV,cu_q,cu_kv,H,scale,g,causal,window,Sb,Pb,dKb,dVb,tid,tgid.x,tgid.y,tgid.z); \
+    bwd_dkv_mpp<T,BQ_,BK_,D,SG>(Q,K,V,dO,lse,delta,dK,dV,cu_q,cu_kv,H,scale,g,causal,window,bias,bias_qs,bias_hs,Sb,Pb,dKb,dVb,tid,tgid.x,tgid.y,tgid.z); \
 }
 INSTANTIATE_BWD_DKV(attn_mpp_bwd_dkv_half,   half,   32, 16, 128)
 INSTANTIATE_BWD_DKV(attn_mpp_bwd_dkv_bfloat, bfloat, 32, 16, 128)
@@ -463,6 +505,7 @@ inline void bwd_dq_mpp(device const T* Q, device const T* K, device const T* V, 
                        device const float* lse, device const float* delta, device float* dQ,
                        device const int* cu_q, device const int* cu_kv,
                        uint H, float scale, uint g, uint causal, uint window,
+                       device const float* bias, uint bias_qs, uint bias_hs,
                        threadgroup float* Sb, threadgroup T* Pb, threadgroup float* dQb,
                        uint tid, uint qtile, uint seq, uint head)
 {
@@ -511,7 +554,11 @@ inline void bwd_dq_mpp(device const T* Q, device const T* K, device const T* V, 
                 bool keep = true;
                 if (causal) keep = jl <= il + coff;
                 if (keep && window > 0) keep = jl > il + coff - int(window);
-                if (keep) w = exp(scale * Sb[e] - lse[ulong(q0 + int(r)) * H + head]);
+                if (keep) {
+                    float lg = scale * Sb[e] - lse[ulong(q0 + int(r)) * H + head];
+                    if (HAS_BIAS) lg += bias[ulong(q0 + int(r)) * bias_qs + ulong(head) * bias_hs + ulong(jl)];
+                    w = exp(lg);
+                }
             }
             Pb[e] = T(w);
         }
@@ -546,11 +593,13 @@ kernel void NAME(                                                               
     device const int* cu_q [[buffer(7)]], device const int* cu_kv [[buffer(8)]], \
     constant uint& H [[buffer(9)]], constant float& scale [[buffer(10)]],       \
     constant uint& g [[buffer(11)]], constant uint& causal [[buffer(12)]], constant uint& window [[buffer(13)]], \
+    device const float* bias [[buffer(14)]],                                    \
+    constant uint& bias_qs [[buffer(15)]], constant uint& bias_hs [[buffer(16)]], \
     uint tid [[thread_index_in_threadgroup]], uint3 tgid [[threadgroup_position_in_grid]]) \
 {                                                                               \
     constexpr int BQ_=BQ, BK_=BK, D=D_, SG=4;                                   \
     threadgroup float Sb[BQ_*BK_]; threadgroup T Pb[BQ_*BK_]; threadgroup float dQb[BQ_*D]; \
-    bwd_dq_mpp<T,BQ_,BK_,D,SG>(Q,K,V,dO,lse,delta,dQ,cu_q,cu_kv,H,scale,g,causal,window,Sb,Pb,dQb,tid,tgid.x,tgid.y,tgid.z); \
+    bwd_dq_mpp<T,BQ_,BK_,D,SG>(Q,K,V,dO,lse,delta,dQ,cu_q,cu_kv,H,scale,g,causal,window,bias,bias_qs,bias_hs,Sb,Pb,dQb,tid,tgid.x,tgid.y,tgid.z); \
 }
 INSTANTIATE_BWD_DQ(attn_mpp_bwd_dq_half,   half,   32, 16, 128)
 INSTANTIATE_BWD_DQ(attn_mpp_bwd_dq_bfloat, bfloat, 32, 16, 128)

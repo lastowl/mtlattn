@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.3.0 (2026-06-17)
+
+Headline: **arbitrary additive attention masks** (prefix-LM / ALiBi / custom
+patterns) now run on the accelerator path, forward and backward, with zero
+throughput cost when unused.
+
+- **Arbitrary additive attention bias (`attn_bias`)** — a per-(query, key)
+  additive mask, `[total_q, H or 1, max_kv]` fp32, added to the logits before
+  softmax (`logit = scale*(q·k) + bias`); `dim1==1` broadcasts across heads.
+  Covers prefix-LM, ALiBi, and arbitrary custom/soft masks — anything not
+  expressible as causal/window. Applied in **both forward and backward**
+  (dQ/dK/dV); the bias is treated as constant (a grad-requiring bias raises —
+  no `dbias` yet). The `sdpa()` / `replace_sdpa()` adapter now routes any
+  general bool or additive-float `attn_mask` (`[Nq,Nkv]` or broadcastable
+  `[B,H,Nq,Nkv]`) through this path, falling back to native SDPA only if MPP is
+  unavailable. **MPP-only** (macOS 26.2+, fp16/bf16, head_dim 64/96/128/256);
+  the simdgroup fallback refuses a bias rather than silently dropping it.
+  - Implemented with a `HAS_BIAS` Metal **function constant**, so the no-bias
+    pipelines are dead-branch-eliminated — measured **zero** throughput impact
+    on the (common) no-bias forward (9.66 vs ~9.5 TF). The bias path abandons
+    the raw-max softmax shortcut (the per-element bias breaks `max(S·scl) =
+    scl·max(S)`) and reduces the max over the full `S·scl + bias·log2(e)` logit;
+    the resulting LSE includes the bias, so the backward just adds `+bias` in
+    its P recompute. Prior art cross-checked against MLX's SDPA (same base-2
+    `×log2(e)` bias fold) — and mtlattn's fused **masked backward** is ahead of
+    MLX, which falls back to unfused autograd for training.
+
 ## 0.2.0 (2026-06-16)
 
 Headline: both the forward **and** the backward now run on the Metal 4

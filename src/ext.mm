@@ -126,6 +126,33 @@ struct Context {
         cache[name] = pso;
         return pso;
     }
+
+    // MPP attention kernels declare a HAS_BIAS function constant (additive
+    // attn_mask). Specialize the pipeline at build time so the no-bias variant
+    // is dead-branch-eliminated (no register/occupancy cost). The kernels have
+    // no default for HAS_BIAS, so they MUST be built through this path, not the
+    // single-arg mpp_pipeline above.
+    id<MTLComputePipelineState> mpp_pipeline(const std::string& name, bool has_bias) {
+        if (mpp_library == nil) return nil;
+        std::string key = name + (has_bias ? "|b" : "");
+        auto it = cache.find(key);
+        if (it != cache.end()) return it->second;
+        id<MTLFunction> func = nil;
+        @autoreleasepool {
+            MTLFunctionConstantValues* cv = [MTLFunctionConstantValues new];
+            bool hb = has_bias;
+            [cv setConstantValue:&hb type:MTLDataTypeBool atIndex:0];
+            NSError* e = nil;
+            func = [mpp_library newFunctionWithName:[NSString stringWithUTF8String:name.c_str()]
+                                     constantValues:cv error:&e];
+        }
+        if (func == nil) return nil;
+        NSError* error = nil;
+        id<MTLComputePipelineState> pso = [device newComputePipelineStateWithFunction:func error:&error];
+        if (pso == nil) return nil;
+        cache[key] = pso;
+        return pso;
+    }
 };
 
 // Metal 4 Performance-Primitives (matmul2d) varlen fast-path. Runs on any GPU
@@ -138,7 +165,9 @@ static bool try_mpp_varlen(const at::Tensor& q, const at::Tensor& k, const at::T
                            at::Tensor& out, const at::Tensor& cu_q, const at::Tensor& cu_kv,
                            int64_t H, int64_t D, int64_t max_seqlen_q, double scale,
                            uint32_t causal, uint32_t gqa_group, uint32_t window,
-                           const at::Tensor& lse, uint32_t return_lse) {
+                           const at::Tensor& lse, uint32_t return_lse,
+                           const at::Tensor& bias, uint32_t has_bias,
+                           uint32_t bias_qs, uint32_t bias_hs) {
     if (D != 128 && D != 64 && D != 96 && D != 256) return false;
     auto st = q.scalar_type();
     if (st != at::kHalf && st != at::kBFloat16) return false;
@@ -147,7 +176,9 @@ static bool try_mpp_varlen(const at::Tensor& q, const at::Tensor& k, const at::T
     // has no simdgroup fallback, so MPP must take it at any length.
     int64_t min_seq = 1024;
     if (const char* e = std::getenv("MTLATTN_MPP_MIN")) min_seq = atoll(e);
-    if (max_seqlen_q < min_seq && D != 256) return false;
+    // With an additive bias, MPP is the ONLY path that supports it (the simdgroup
+    // fallback refuses), so it must take any sequence length, not just large ones.
+    if (max_seqlen_q < min_seq && D != 256 && has_bias == 0) return false;
     // Kernel assumes head stride == D (last dim contiguous, heads packed);
     // row stride is passed per-tensor so strided unbind views need no copy.
     if (q.stride(1) != D || k.stride(1) != D || v.stride(1) != D) return false;
@@ -168,7 +199,7 @@ static bool try_mpp_varlen(const at::Tensor& q, const at::Tensor& k, const at::T
     std::string suffix = (D == 128) ? "" : ("_d" + std::to_string(D));
     std::string kname = std::string("attn_mpp_varlen_") + (st == at::kHalf ? "half" : "bfloat")
                       + suffix + (tm32 ? "_tm32" : "");
-    auto pso = ctx.mpp_pipeline(kname);
+    auto pso = ctx.mpp_pipeline(kname, has_bias != 0);
     if (pso == nil) return false;
 
     const int64_t B = cu_q.numel() - 1;
@@ -183,6 +214,8 @@ static bool try_mpp_varlen(const at::Tensor& q, const at::Tensor& k, const at::T
                cqo=cu_q.storage_offset()*4, cko=cu_kv.storage_offset()*4;
     id<MTLBuffer> lb=at::native::mps::getMTLBufferStorage(lse);
     NSUInteger lo=lse.storage_offset()*4; uint32_t rlse=return_lse;
+    id<MTLBuffer> biasb=at::native::mps::getMTLBufferStorage(bias);
+    NSUInteger biaso=bias.storage_offset()*bias.element_size();
     auto* stream = at::mps::getCurrentMPSStream();
     MTLSize tg = MTLSizeMake(qtiles, (NSUInteger)B, (NSUInteger)H);
     MTLSize tpt = MTLSizeMake(pso.threadExecutionWidth * 4, 1, 1);
@@ -199,6 +232,8 @@ static bool try_mpp_varlen(const at::Tensor& q, const at::Tensor& k, const at::T
             [enc setBytes:&gqa_group length:4 atIndex:12];
             [enc setBytes:&window length:4 atIndex:13];
             [enc setBuffer:lb offset:lo atIndex:14]; [enc setBytes:&rlse length:4 atIndex:15];
+            [enc setBuffer:biasb offset:biaso atIndex:16];
+            [enc setBytes:&bias_qs length:4 atIndex:17]; [enc setBytes:&bias_hs length:4 atIndex:18];
             [enc dispatchThreadgroups:tg threadsPerThreadgroup:tpt];
             [enc endEncoding];
         }
@@ -239,7 +274,8 @@ at::Tensor varlen_attention(
     double scale,
     bool causal,
     int64_t window,
-    c10::optional<at::Tensor> lse_out   // optional [total_q, H] fp32; if given, emit LSE
+    c10::optional<at::Tensor> lse_out,  // optional [total_q, H] fp32; if given, emit LSE
+    c10::optional<at::Tensor> attn_bias // optional [total_q, H or 1, max_kv] fp32 additive mask
 ) {
     TORCH_CHECK(q.device().is_mps() && k.device().is_mps() && v.device().is_mps(),
                 "mtlattn: q/k/v must be MPS tensors");
@@ -278,6 +314,30 @@ at::Tensor varlen_attention(
     // The LSE buffer must always be bound; 1-elem dummy when not wanted.
     at::Tensor lse = want_lse ? *lse_out : at::empty({1}, q.options().dtype(at::kFloat));
 
+    // Optional additive attention bias [total_q, H or 1, max_kv] fp32 (MPP-only).
+    // Added to the logit before softmax: logit = scale*(Q·K) + bias[q, head, key],
+    // where `key` is the seq-local key index. dim1==1 broadcasts across heads
+    // (zero head stride). The buffer is always bound (1-elem dummy when absent);
+    // the kernel's HAS_BIAS function constant gates the reads.
+    const bool want_bias = attn_bias.has_value() && attn_bias->defined() && attn_bias->numel() > 0;
+    uint32_t bias_qs = 0, bias_hs = 0;
+    at::Tensor bias_t;
+    if (want_bias) {
+        bias_t = *attn_bias;
+        TORCH_CHECK(bias_t.device().is_mps(), "mtlattn: attn_mask must be an MPS tensor");
+        TORCH_CHECK(bias_t.scalar_type() == at::kFloat, "mtlattn: attn_mask must be float32");
+        TORCH_CHECK(bias_t.dim() == 3, "mtlattn: attn_mask must be [total_q, H or 1, max_kv]");
+        TORCH_CHECK(bias_t.size(0) == q.size(0),
+                    "mtlattn: attn_mask dim0 (", bias_t.size(0), ") must equal total_q (", q.size(0), ")");
+        TORCH_CHECK(bias_t.size(1) == H || bias_t.size(1) == 1,
+                    "mtlattn: attn_mask dim1 must be num_heads (", H, ") or 1 (broadcast)");
+        TORCH_CHECK(bias_t.stride(2) == 1, "mtlattn: attn_mask last dim must be contiguous");
+        bias_qs = (uint32_t)bias_t.stride(0);
+        bias_hs = (bias_t.size(1) == 1) ? 0u : (uint32_t)bias_t.stride(1);
+    } else {
+        bias_t = at::empty({1}, q.options().dtype(at::kFloat));
+    }
+
     // Metal 4 MPP fast-path (matmul2d; M5 Neural Accelerator where present,
     // regular matrix units on other macOS-26.2 GPUs). Emits LSE on demand, so it
     // also serves the forward of a training step. Falls through on any
@@ -285,13 +345,19 @@ at::Tensor varlen_attention(
     if (q.size(0) > 0 && !std::getenv("MTLATTN_NO_MPP")) {
         if (try_mpp_varlen(q, k, v, out, cu_q, cu_kv, H, D, max_seqlen_q, scale,
                            causal ? 1u : 0u, gqa_group, (uint32_t)(window > 0 ? window : 0),
-                           lse, want_lse ? 1u : 0u))
+                           lse, want_lse ? 1u : 0u,
+                           bias_t, want_bias ? 1u : 0u, bias_qs, bias_hs))
             return out;
     }
     // The portable simdgroup kernels are sized for head_dim <= 128; > 128 (256)
     // is MPP-only, so if we reach here with D > 128 the fast path was unavailable.
     TORCH_CHECK(D <= HEAD_DIM_MAX, "mtlattn: head_dim ", D,
                 " (> 128) requires the MPP path (macOS 26.2+, fp16/bf16, no LSE)");
+    // The additive attn_mask is implemented only on the MPP path; refuse rather
+    // than silently dropping the bias on the simdgroup fallback.
+    TORCH_CHECK(!(want_bias && q.size(0) > 0),
+                "mtlattn: additive attn_mask requires the MPP path (macOS 26.2+, "
+                "fp16/bf16, head_dim 64/96/128/256, head stride == D); not available here");
 
     Params p;
     p.num_heads = (uint32_t)H;
@@ -376,17 +442,18 @@ at::Tensor varlen_attention(
 static std::tuple<at::Tensor, at::Tensor> mpp_bwd_dkv(
     const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
     const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
-    int64_t, double, bool, int64_t);
+    int64_t, double, bool, int64_t, c10::optional<at::Tensor>);
 static at::Tensor mpp_bwd_dq(
     const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
     const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
-    int64_t, double, bool, int64_t);
+    int64_t, double, bool, int64_t, c10::optional<at::Tensor>);
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor> varlen_attention_bwd(
     const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
     const at::Tensor& o, const at::Tensor& dout, const at::Tensor& lse,
     const at::Tensor& cu_seqlens_q, const at::Tensor& cu_seqlens_kv,
-    double scale, bool causal, int64_t window) {
+    double scale, bool causal, int64_t window,
+    c10::optional<at::Tensor> attn_bias) {
     const int64_t total_q = q.size(0), Hq = q.size(1), D = q.size(2);
     const int64_t total_kv = k.size(0), Hkv = k.size(1);
     auto cu_q = cu_seqlens_q.contiguous(), cu_kv = cu_seqlens_kv.contiguous();
@@ -405,11 +472,16 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> varlen_attention_bwd(
             maxq = std::max(maxq, (int64_t)(cqp[s+1]-cqp[s]));
             maxk = std::max(maxk, (int64_t)(ckp[s+1]-ckp[s]));
         }
-        auto dQf = mpp_bwd_dq(q, k, v, dout, lse, delta, cu_q, cu_kv, maxq, scale, causal, window);
-        auto dkv = mpp_bwd_dkv(q, k, v, dout, lse, delta, cu_q, cu_kv, maxk, scale, causal, window);
+        auto dQf = mpp_bwd_dq(q, k, v, dout, lse, delta, cu_q, cu_kv, maxq, scale, causal, window, attn_bias);
+        auto dkv = mpp_bwd_dkv(q, k, v, dout, lse, delta, cu_q, cu_kv, maxk, scale, causal, window, attn_bias);
         return {dQf.to(q.scalar_type()), std::get<0>(dkv).to(k.scalar_type()),
                 std::get<1>(dkv).to(v.scalar_type())};
     }
+
+    // The simdgroup fallback backward does not implement the additive mask.
+    TORCH_CHECK(!(attn_bias.has_value() && attn_bias->defined() && attn_bias->numel() > 0),
+                "mtlattn: additive attn_mask backward requires the MPP path "
+                "(macOS 26.2+, fp16/bf16, head_dim 64/96/128/256)");
 
     auto dQ = at::empty_like(q), dK = at::empty_like(k), dV = at::empty_like(v);
     auto delta = at::empty({total_q, Hq}, q.options().dtype(at::kFloat));
@@ -475,19 +547,26 @@ static std::tuple<at::Tensor, at::Tensor> mpp_bwd_dkv(
     const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, const at::Tensor& dO,
     const at::Tensor& lse, const at::Tensor& delta,
     const at::Tensor& cu_q, const at::Tensor& cu_kv,
-    int64_t max_seqlen_kv, double scale, bool causal, int64_t window) {
+    int64_t max_seqlen_kv, double scale, bool causal, int64_t window,
+    c10::optional<at::Tensor> attn_bias) {
     const auto Hq = q.size(1), D = q.size(2), Hkv = k.size(1);
     const uint32_t g = (uint32_t)(Hq / Hkv);
     const int64_t num_seqs = cu_q.numel() - 1;
     auto dK = at::zeros({k.size(0), Hkv, D}, k.options().dtype(at::kFloat));
     auto dV = at::zeros_like(dK);
+    const bool want_bias = attn_bias.has_value() && attn_bias->defined() && attn_bias->numel() > 0;
+    uint32_t bias_qs = 0, bias_hs = 0;
+    at::Tensor bias_t = want_bias ? *attn_bias : at::empty({1}, q.options().dtype(at::kFloat));
+    if (want_bias) { bias_qs = (uint32_t)bias_t.stride(0); bias_hs = (bias_t.size(1) == 1) ? 0u : (uint32_t)bias_t.stride(1); }
     auto& ctx = Context::instance();
-    auto pso = ctx.mpp_pipeline(std::string("attn_mpp_bwd_dkv_") + (q.scalar_type() == at::kHalf ? "half" : "bfloat") + (D == 128 ? "" : ("_d" + std::to_string(D))));
+    auto pso = ctx.mpp_pipeline(std::string("attn_mpp_bwd_dkv_") + (q.scalar_type() == at::kHalf ? "half" : "bfloat") + (D == 128 ? "" : ("_d" + std::to_string(D))), want_bias);
     TORCH_CHECK(pso != nil, "mtlattn: mpp bwd dkv pipeline unavailable");
     auto cuq = cu_q.contiguous(), cukv = cu_kv.contiguous();
     auto dOc = dO.contiguous();
     uint32_t Hh = (uint32_t)Hq; float sc = (float)scale;
     uint32_t gg = g, caus = causal ? 1u : 0u, win = (uint32_t)(window > 0 ? window : 0);
+    id<MTLBuffer> biasb = at::native::mps::getMTLBufferStorage(bias_t);
+    NSUInteger biaso = bias_t.storage_offset() * bias_t.element_size();
     const uint32_t BK = (D == 256) ? 8 : 16;   // dK/dV accumulator is tight at 256
     uint32_t ktiles = ((uint32_t)max_seqlen_kv + BK - 1) / BK;
     NSUInteger es = q.element_size();
@@ -513,6 +592,8 @@ static std::tuple<at::Tensor, at::Tensor> mpp_bwd_dkv(
             [enc setBuffer:cqb offset:cqo atIndex:8]; [enc setBuffer:ckb offset:cko atIndex:9];
             [enc setBytes:&Hh length:4 atIndex:10]; [enc setBytes:&sc length:4 atIndex:11];
             [enc setBytes:&gg length:4 atIndex:12]; [enc setBytes:&caus length:4 atIndex:13]; [enc setBytes:&win length:4 atIndex:14];
+            [enc setBuffer:biasb offset:biaso atIndex:15];
+            [enc setBytes:&bias_qs length:4 atIndex:16]; [enc setBytes:&bias_hs length:4 atIndex:17];
             [enc dispatchThreadgroups:tg threadsPerThreadgroup:tpt];
             [enc endEncoding];
         }
@@ -525,18 +606,25 @@ static at::Tensor mpp_bwd_dq(
     const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, const at::Tensor& dO,
     const at::Tensor& lse, const at::Tensor& delta,
     const at::Tensor& cu_q, const at::Tensor& cu_kv,
-    int64_t max_seqlen_q, double scale, bool causal, int64_t window) {
+    int64_t max_seqlen_q, double scale, bool causal, int64_t window,
+    c10::optional<at::Tensor> attn_bias) {
     const auto Hq = q.size(1), D = q.size(2), Hkv = k.size(1);
     const uint32_t g = (uint32_t)(Hq / Hkv);
     const int64_t num_seqs = cu_q.numel() - 1;
     auto dQ = at::zeros({q.size(0), Hq, D}, q.options().dtype(at::kFloat));
+    const bool want_bias = attn_bias.has_value() && attn_bias->defined() && attn_bias->numel() > 0;
+    uint32_t bias_qs = 0, bias_hs = 0;
+    at::Tensor bias_t = want_bias ? *attn_bias : at::empty({1}, q.options().dtype(at::kFloat));
+    if (want_bias) { bias_qs = (uint32_t)bias_t.stride(0); bias_hs = (bias_t.size(1) == 1) ? 0u : (uint32_t)bias_t.stride(1); }
     auto& ctx = Context::instance();
-    auto pso = ctx.mpp_pipeline(std::string("attn_mpp_bwd_dq_") + (q.scalar_type() == at::kHalf ? "half" : "bfloat") + (D == 128 ? "" : ("_d" + std::to_string(D))));
+    auto pso = ctx.mpp_pipeline(std::string("attn_mpp_bwd_dq_") + (q.scalar_type() == at::kHalf ? "half" : "bfloat") + (D == 128 ? "" : ("_d" + std::to_string(D))), want_bias);
     TORCH_CHECK(pso != nil, "mtlattn: mpp bwd dq pipeline unavailable");
     auto cuq = cu_q.contiguous(), cukv = cu_kv.contiguous();
     auto dOc = dO.contiguous();
     uint32_t Hh = (uint32_t)Hq; float sc = (float)scale;
     uint32_t gg = g, caus = causal ? 1u : 0u, win = (uint32_t)(window > 0 ? window : 0);
+    id<MTLBuffer> biasb = at::native::mps::getMTLBufferStorage(bias_t);
+    NSUInteger biaso = bias_t.storage_offset() * bias_t.element_size();
     const uint32_t BQ = (D == 256) ? 16 : 32;   // dQ accumulator is tight at 256
     uint32_t qtiles = ((uint32_t)max_seqlen_q + BQ - 1) / BQ;
     NSUInteger es = q.element_size();
@@ -562,6 +650,8 @@ static at::Tensor mpp_bwd_dq(
             [enc setBuffer:cqb offset:cqo atIndex:7]; [enc setBuffer:ckb offset:cko atIndex:8];
             [enc setBytes:&Hh length:4 atIndex:9]; [enc setBytes:&sc length:4 atIndex:10];
             [enc setBytes:&gg length:4 atIndex:11]; [enc setBytes:&caus length:4 atIndex:12]; [enc setBytes:&win length:4 atIndex:13];
+            [enc setBuffer:biasb offset:biaso atIndex:14];
+            [enc setBytes:&bias_qs length:4 atIndex:15]; [enc setBytes:&bias_hs length:4 atIndex:16];
             [enc dispatchThreadgroups:tg threadsPerThreadgroup:tpt];
             [enc endEncoding];
         }
@@ -575,7 +665,7 @@ static at::Tensor mpp_bwd_dq(
 // True iff the mpp metallib loaded and a kernel compiles to a pipeline — i.e.
 // macOS 26.2+ with MPP support. Used to confirm the path runs on M3/M4, not just M5.
 static bool mpp_available() {
-    return Context::instance().mpp_pipeline("attn_mpp_varlen_half") != nil;
+    return Context::instance().mpp_pipeline("attn_mpp_varlen_half", false) != nil;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -583,20 +673,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("mpp_bwd_dkv", &mpp_bwd_dkv, "matmul2d dK/dV backward (test entry)",
           py::arg("q"), py::arg("k"), py::arg("v"), py::arg("dO"), py::arg("lse"), py::arg("delta"),
           py::arg("cu_q"), py::arg("cu_kv"), py::arg("max_seqlen_kv"), py::arg("scale"),
-          py::arg("causal") = false, py::arg("window") = 0);
+          py::arg("causal") = false, py::arg("window") = 0, py::arg("attn_bias") = c10::nullopt);
     m.def("mpp_bwd_dq", &mpp_bwd_dq, "matmul2d dQ backward (test entry)",
           py::arg("q"), py::arg("k"), py::arg("v"), py::arg("dO"), py::arg("lse"), py::arg("delta"),
           py::arg("cu_q"), py::arg("cu_kv"), py::arg("max_seqlen_q"), py::arg("scale"),
-          py::arg("causal") = false, py::arg("window") = 0);
+          py::arg("causal") = false, py::arg("window") = 0, py::arg("attn_bias") = c10::nullopt);
     m.def("varlen_attention", &varlen_attention,
           "Fused varlen attention forward (MPS)",
           py::arg("q"), py::arg("k"), py::arg("v"),
           py::arg("cu_seqlens_q"), py::arg("cu_seqlens_kv"),
           py::arg("max_seqlen_q"), py::arg("scale"), py::arg("causal") = false,
-          py::arg("window") = 0, py::arg("lse_out") = c10::nullopt);
+          py::arg("window") = 0, py::arg("lse_out") = c10::nullopt,
+          py::arg("attn_bias") = c10::nullopt);
     m.def("varlen_attention_bwd", &varlen_attention_bwd,
           "Varlen attention backward (dQ, dK, dV)",
           py::arg("q"), py::arg("k"), py::arg("v"), py::arg("o"), py::arg("dout"),
           py::arg("lse"), py::arg("cu_seqlens_q"), py::arg("cu_seqlens_kv"),
-          py::arg("scale"), py::arg("causal") = false, py::arg("window") = 0);
+          py::arg("scale"), py::arg("causal") = false, py::arg("window") = 0,
+          py::arg("attn_bias") = c10::nullopt);
 }

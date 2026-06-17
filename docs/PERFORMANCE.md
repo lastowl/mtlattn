@@ -69,6 +69,14 @@ Forward (`attn_vl`, MPP):
   scl·max(S)`, scale once not per key).
 - PV uses `matmul2d` `multiply_accumulate` straight into the threadgroup O
   accumulator — no separate PV buffer (that 8 KB freed is what enables the tile).
+- **Additive bias (`attn_bias`) is a `HAS_BIAS` function constant**, not a runtime
+  flag — the no-bias pipeline is dead-branch-eliminated, so it keeps its exact
+  register footprint (measured: **no** throughput change, 9.66 vs ~9.5 TF). A
+  runtime branch was rejected: this kernel is occupancy-bound, so the bias
+  branch's extra registers would pressure occupancy even when bias is off. The
+  bias path can't use the raw-max shortcut (per-element bias breaks `max(S·scl) =
+  scl·max(S)`), so it scans the full `S·scl + bias·log2(e)` logit and reads the
+  bias twice (max scan + exp) — modestly slower, only when a bias is supplied.
 
 Backward (`bwd_dq_mpp` / `bwd_dkv_mpp`, MPP):
 - **dQ: BQ=32 grid / BK=16 inner. dK/dV: BK=16 grid / BQ=32 inner.** head_dim 256
@@ -125,11 +133,49 @@ Simdgroup fallback (`attn_mpp.metal` → no; `attention.metal`):
   leaves orphaned command buffers that **wedge the device to ~¼ throughput** and
   require a **reboot/logout** to clear. Sync every ~10–20 iterations.
 
+## Low-precision matmul2d — fp8 vs int8 (measured)
+
+We're at ~33% of the NA fp16 peak, so a lower-precision operand path is the one
+*large* lever left. Investigated which precision actually buys throughput on the
+M5 NA. **Microbench: M=N=K=64 `matmul2d multiply_accumulate`, 40000 iters, 2048
+threadgroups, SG=4, M5 Pro:**
+
+| operand | accumulator | throughput | vs fp16 |
+|---|---|---|---|
+| `half` | float | **32.3 TFLOPS** | 1.0× |
+| `bfloat` | float | 32.2 TFLOPS | 1.0× |
+| `int8_t` | int | **61.3 TOPS** | **~2.0×** |
+
+So **int8 is a real, native 2× on the M5 NA** — and `int4b_format`/`uint4b_format`
+are also `matmul2d` operand types (potential ~4×, not yet benched; packed-format
+handling is fiddly).
+
+**fp8 is NOT a lever right now:**
+- **Not in the `matmul2d` operand set** on this toolchain (`-std=metal4.0`). The
+  accepted element types are `uint8_t / int8_t / uint4b_format / int4b_format /
+  float / half / bfloat` — a `static_assert` rejects anything else. No fp8.
+- **Native fp8/fp4 arrive in Metal 4.1 / macOS 27.0**, not 26.x: headers expose
+  `Float8E5M2`, `Float8E4M3`, `Float4E2M1`, `UInt2`, `Int2` (OCP mxfp8/mxfp4 with
+  an E8M0 per-32-block scale), all `API_AVAILABLE(macos(27.0))`. **Whether the M5
+  NA hardware-accelerates them in `matmul2d` is undocumented and untested** — could
+  be HW or could be emulation. Revisit when on macOS 27.
+- **Software-emulated fp8 is *slower* than fp16.** `tashiscool/fp8-mps-metal`
+  stores e4m3 in `uint8_t` and decodes in-register (needs PyTorch 2.10+
+  `compile_shader`, monkey-patches `torch._scaled_mm`); its fused kernel runs
+  **~4–26× slower than fp16**. Useful for memory/compat, never for speed.
+
+**Takeaway:** the lower-precision path to ~2× is **int8 quantization, not fp8** —
+available today, native, confirmed 2× at the matmul level. The open work is the
+*accuracy* side: quantizing Q/K/V (and P for PV) with per-row/block scales, where
+activation outliers (the same ones that force fp32 accumulators here) make
+attention harder to quantize than weights. int4 is a further ~2× if accuracy holds.
+
 ## Remaining headroom (all large/uncertain)
 
-1. **fp8** — if the M5 NA does fp8 `matmul2d`, fp8 operands could ~2× throughput
-   (we're at ~33% of the NA fp16 peak). Precision risk; unproven here. The one
-   potentially large lever, and it would help both forward and backward.
+1. **int8-quantized attention** — the largest measured lever (native 2× on the M5
+   NA; helps forward *and* backward). Needs Q/K/V quantization with scales and an
+   accuracy validation pass; activation outliers are the risk. int4 doubles it
+   again if accuracy survives. fp8 deferred to macOS 27 (see above).
 2. **Manual register-resident softmax** (cooperative-tensor scores + hand-rolled
    cross-simdgroup reduction, since `reduce_rows` is out) — could shave the
    forward's threadgroup round-trip, but high occupancy/correctness risk.

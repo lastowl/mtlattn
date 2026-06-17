@@ -9,10 +9,12 @@ import torch
 import mtlattn
 
 
-def ref_varlen(q, k, v, q_lens, kv_lens, scale, causal=False, window=0):
+def ref_varlen(q, k, v, q_lens, kv_lens, scale, causal=False, window=0, bias=None):
     """Per-sequence fp32 SDPA on CPU. causal: key j seen by query i iff
     j <= i + (kv_len - q_len) (flash_attn end-aligned convention). window>0:
-    additionally j > i + (kv_len - q_len) - window (sliding window)."""
+    additionally j > i + (kv_len - q_len) - window (sliding window). bias:
+    optional additive [Mq, H, max_kv] fp32 added to the logits before softmax,
+    indexed by global query row, head, and seq-local key."""
     out = torch.empty_like(q, dtype=torch.float32)
     qo = kvo = 0
     for ql, kl in zip(q_lens, kv_lens):
@@ -20,6 +22,8 @@ def ref_varlen(q, k, v, q_lens, kv_lens, scale, causal=False, window=0):
         ki = k[kvo:kvo + kl].float().permute(1, 0, 2)
         vi = v[kvo:kvo + kl].float().permute(1, 0, 2)
         a = (qi @ ki.transpose(-1, -2)) * scale
+        if bias is not None:
+            a = a + bias[qo:qo + ql, :, :kl].float().permute(1, 0, 2)  # [H, ql, kl]
         i = torch.arange(ql)[:, None]
         j = torch.arange(kl)[None, :]
         coff = kl - ql
@@ -207,6 +211,104 @@ def run_bwd_case(name, q_lens, kv_lens, Hq, Hkv, D, dtype, atol, causal=False, w
     return ok
 
 
+def _make_bias(Mq, H, max_kv, broadcast, seed=7):
+    """Additive bias [Mq, H or 1, max_kv] fp32, and its per-head-expanded form
+    for the reference. Mix of smooth and a few -inf-ish entries to exercise the
+    softmax max/normalize with a real mask."""
+    torch.manual_seed(seed)
+    hb = 1 if broadcast else H
+    b = torch.randn(Mq, hb, max_kv, dtype=torch.float32)
+    b[:, :, ::7] -= 30.0  # strongly-suppressed keys (near -inf after softmax)
+    ref = b.expand(Mq, H, max_kv).contiguous() if broadcast else b
+    return b, ref
+
+
+def run_bias_case(name, q_lens, kv_lens, H, D, dtype, atol, causal=False,
+                  window=0, broadcast=False):
+    """Forward with an additive attn_mask (per-head or head-broadcast)."""
+    torch.manual_seed(0)
+    Mq, Mkv = sum(q_lens), sum(kv_lens)
+    max_kv = max(kv_lens)
+    q = torch.randn(Mq, H, D, dtype=dtype)
+    k = torch.randn(Mkv, H, D, dtype=dtype)
+    v = torch.randn(Mkv, H, D, dtype=dtype)
+    scale = 1.0 / math.sqrt(D)
+    b, bref = _make_bias(Mq, H, max_kv, broadcast)
+    ref = ref_varlen(q, k, v, q_lens, kv_lens, scale, causal, window, bias=bref)
+    out = mtlattn.varlen_attention(
+        q.to("mps"), k.to("mps"), v.to("mps"), cu(q_lens), cu(kv_lens),
+        max(q_lens), scale, causal=causal, window=window, attn_bias=b.to("mps"),
+    ).cpu().float()
+    err = (out - ref).abs().max().item()
+    ok = err < atol
+    print(f"{name}: max_err={err:.2e} (atol={atol}) {'OK' if ok else 'FAIL'}")
+    return ok
+
+
+def run_bias_bwd_case(name, q_lens, kv_lens, Hq, Hkv, D, dtype, atol, causal=False, broadcast=False):
+    """Gradients (dQ/dK/dV) with a constant additive attn_mask vs a
+    differentiable fp32 reference (bias held constant)."""
+    torch.manual_seed(0)
+    g = Hq // Hkv
+    scale = 1.0 / math.sqrt(D)
+    Mq, Mk = sum(q_lens), sum(kv_lens)
+    max_kv = max(kv_lens)
+    q = torch.randn(Mq, Hq, D, dtype=dtype)
+    k = torch.randn(Mk, Hkv, D, dtype=dtype)
+    v = torch.randn(Mk, Hkv, D, dtype=dtype)
+    b, bref = _make_bias(Mq, Hq, max_kv, broadcast)
+    qm = q.to("mps").requires_grad_(); km = k.to("mps").requires_grad_(); vm = v.to("mps").requires_grad_()
+    out = mtlattn.varlen_attention(qm, km, vm, cu(q_lens), cu(kv_lens), max(q_lens),
+                                   causal=causal, attn_bias=b.to("mps"))
+    dO = torch.randn_like(out)
+    out.backward(dO)
+
+    qr = q.float().requires_grad_()
+    kr = k.repeat_interleave(g, 1).float().requires_grad_()
+    vr = v.repeat_interleave(g, 1).float().requires_grad_()
+    outs, qo, ko = [], 0, 0
+    for ql, kl in zip(q_lens, kv_lens):
+        qi = qr[qo:qo + ql].permute(1, 0, 2)
+        ki = kr[ko:ko + kl].permute(1, 0, 2)
+        vi = vr[ko:ko + kl].permute(1, 0, 2)
+        a = (qi @ ki.transpose(-1, -2)) * scale
+        a = a + bref[qo:qo + ql, :, :kl].permute(1, 0, 2)
+        if causal:
+            i = torch.arange(ql)[:, None]; j = torch.arange(kl)[None, :]; coff = kl - ql
+            a = a.masked_fill(~(j <= i + coff), float("-inf"))
+        outs.append((a.softmax(-1) @ vi).permute(1, 0, 2)); qo += ql; ko += kl
+    torch.cat(outs, 0).backward(dO.cpu().float())
+    gk = kr.grad.view(Mk, Hkv, g, D).sum(2)
+    gv = vr.grad.view(Mk, Hkv, g, D).sum(2)
+    eq = (qm.grad.cpu().float() - qr.grad).abs().max().item()
+    ek = (km.grad.cpu().float() - gk).abs().max().item()
+    ev = (vm.grad.cpu().float() - gv).abs().max().item()
+    ok = max(eq, ek, ev) < atol
+    print(f"{name}: dQ={eq:.2e} dK={ek:.2e} dV={ev:.2e} (atol={atol}) {'OK' if ok else 'FAIL'}")
+    return ok
+
+
+def run_sdpa_mask_case(name, B, H, N, D, dtype, atol, bool_mask=False, broadcast_head=False):
+    """Dense sdpa() with an attn_mask (float additive or bool) vs native fp32 SDPA."""
+    import torch.nn.functional as F
+    torch.manual_seed(0)
+    q = torch.randn(B, H, N, D, dtype=dtype)
+    k = torch.randn(B, H, N, D, dtype=dtype)
+    v = torch.randn(B, H, N, D, dtype=dtype)
+    hb = 1 if broadcast_head else H
+    if bool_mask:
+        m = torch.rand(B, hb, N, N) > 0.3
+        m[..., 0] = True                    # guarantee >=1 visible key per row
+    else:
+        m = torch.randn(B, hb, N, N, dtype=torch.float32)
+    out = mtlattn.sdpa(q.to("mps"), k.to("mps"), v.to("mps"), attn_mask=m.to("mps")).cpu().float()
+    ref = F.scaled_dot_product_attention(q.float(), k.float(), v.float(), attn_mask=m).float()
+    err = (out - ref).abs().max().item()
+    ok = err < atol
+    print(f"{name}: max_err={err:.2e} (atol={atol}) {'OK' if ok else 'FAIL'}")
+    return ok
+
+
 def main():
     results = []
     # dtype -> tolerance (inputs are random N(0,1); fp16/bf16 storage rounding
@@ -283,6 +385,26 @@ def main():
     if mtlattn._C.mpp_available() and not os.environ.get("MTLATTN_NO_MPP"):
         results.append(run_bwd_case("bwd fp16 D=256", [512], [512], 8, 8, 256, torch.float16, 6e-3, causal=True))
 
+    # Arbitrary additive attn_mask (MPP-only). Forward + backward, per-head and
+    # head-broadcast, with/without causal, ragged varlen, fp16/bf16, D 64/96/128/256.
+    if mtlattn._C.mpp_available() and not os.environ.get("MTLATTN_NO_MPP"):
+        results.append(run_bias_case("bias fwd perhead D128", [1536], [1536], 8, 128, torch.float16, 5e-3))
+        results.append(run_bias_case("bias fwd broadcast D128", [1536], [1536], 8, 128, torch.float16, 5e-3, broadcast=True))
+        results.append(run_bias_case("bias fwd causal D128", [1536], [1536], 12, 128, torch.float16, 5e-3, causal=True))
+        results.append(run_bias_case("bias fwd ragged varlen", [200, 50, 1300], [200, 50, 1300], 8, 128, torch.float16, 5e-3))
+        results.append(run_bias_case("bias fwd cross", [64], [900], 8, 128, torch.float16, 5e-3))
+        results.append(run_bias_case("bias fwd SWA", [1536], [1536], 8, 128, torch.float16, 5e-3, causal=True, window=128))
+        results.append(run_bias_case("bias fwd bf16", [1500], [1500], 8, 128, torch.bfloat16, 3e-2, broadcast=True))
+        results.append(run_bias_case("bias fwd D64", [2048], [2048], 12, 64, torch.float16, 5e-3))
+        results.append(run_bias_case("bias fwd D96 causal", [2048], [2048], 8, 96, torch.float16, 5e-3, causal=True))
+        results.append(run_bias_case("bias fwd D256", [1024], [1024], 8, 256, torch.float16, 6e-3))
+        results.append(run_bias_bwd_case("bias bwd perhead D128", [1280], [1280], 8, 8, 128, torch.float16, 5e-3))
+        results.append(run_bias_bwd_case("bias bwd broadcast D128", [1280], [1280], 8, 8, 128, torch.float16, 5e-3, broadcast=True))
+        results.append(run_bias_bwd_case("bias bwd causal D128", [1280], [1280], 12, 12, 128, torch.float16, 5e-3, causal=True))
+        results.append(run_bias_bwd_case("bias bwd GQA causal", [1024], [1024], 8, 2, 128, torch.float16, 6e-3, causal=True))
+        results.append(run_bias_bwd_case("bias bwd ragged", [128, 700], [128, 700], 8, 8, 128, torch.float16, 5e-3))
+        results.append(run_bias_bwd_case("bias bwd D64 bf16", [1280], [1280], 8, 8, 64, torch.bfloat16, 4e-2))
+
     # The SDPA adapter cases go through torch's own MPS ops (permute/contiguous
     # -> a runtime-compiled transpose shader). Set MTLATTN_SKIP_SDPA to skip them
     # where torch can't JIT-compile MPS shaders (e.g. headless CI runners, which
@@ -297,6 +419,12 @@ def main():
         # replace_sdpa key-padding mask -> varlen conversion (full and causal).
         results.append(run_padding_case("pad mask", 4, 8, 1024, 128, [1024, 800, 500, 1024], torch.float16, 5e-3))
         results.append(run_padding_case("pad mask causal", 3, 12, 1024, 128, [1024, 700, 400], torch.float16, 5e-3, causal=True))
+        # sdpa() with a general attn_mask -> additive-bias path (MPP-only).
+        if mtlattn._C.mpp_available() and not os.environ.get("MTLATTN_NO_MPP"):
+            results.append(run_sdpa_mask_case("sdpa float mask perhead", 2, 8, 1024, 128, torch.float16, 5e-3))
+            results.append(run_sdpa_mask_case("sdpa float mask broadcast", 2, 8, 1024, 128, torch.float16, 5e-3, broadcast_head=True))
+            results.append(run_sdpa_mask_case("sdpa bool mask", 2, 8, 1024, 128, torch.float16, 5e-3, bool_mask=True))
+            results.append(run_sdpa_mask_case("sdpa bool mask broadcast", 1, 12, 2048, 128, torch.float16, 5e-3, bool_mask=True, broadcast_head=True))
     # outlier channels (real transformer activations spike to 1e2-1e3; QK
     # partial sums must not overflow — caught a NaN bug in half fragments)
     torch.manual_seed(3)
