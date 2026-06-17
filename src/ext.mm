@@ -158,9 +158,12 @@ struct Context {
 // Metal 4 Performance-Primitives (matmul2d) varlen fast-path. Runs on any GPU
 // with macOS 26.2+ (the path is OS-gated, not GPU-family-gated); on M5 matmul2d
 // targets the per-core Neural Accelerator (~9 TFLOPS), on M3/M4 it runs on the
-// regular GPU matrix units (faster than the hand-written simdgroup kernel; exact
-// speed there is unconfirmed — no M3/M4 hardware on hand). Conditions: MPP
-// metallib loaded, head_dim in {64,128}, dtype half/bfloat, head stride == D.
+// regular GPU matrix units (faster than the hand-written simdgroup kernel).
+// Conditions: MPP metallib loaded, head_dim supported, dtype half/bfloat, head
+// stride == D. M4 (Mac mini, Apple9) is available for cross-chip validation.
+static at::Tensor attn_splitkv(const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                               const at::Tensor&, const at::Tensor&, int64_t, double, bool, int64_t);
+
 static bool try_mpp_varlen(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
                            at::Tensor& out, const at::Tensor& cu_q, const at::Tensor& cu_kv,
                            int64_t H, int64_t D, int64_t max_seqlen_q, double scale,
@@ -168,7 +171,7 @@ static bool try_mpp_varlen(const at::Tensor& q, const at::Tensor& k, const at::T
                            const at::Tensor& lse, uint32_t return_lse,
                            const at::Tensor& bias, uint32_t has_bias,
                            uint32_t bias_qs, uint32_t bias_hs) {
-    if (D != 128 && D != 64 && D != 96 && D != 256) return false;
+    if (D != 128 && D != 64 && D != 96 && D != 256 && D != 80 && D != 88 && D != 160) return false;
     auto st = q.scalar_type();
     if (st != at::kHalf && st != at::kBFloat16) return false;
     // MPP wins on large sequences; small windows are faster on the simdgroup
@@ -178,7 +181,7 @@ static bool try_mpp_varlen(const at::Tensor& q, const at::Tensor& k, const at::T
     if (const char* e = std::getenv("MTLATTN_MPP_MIN")) min_seq = atoll(e);
     // With an additive bias, MPP is the ONLY path that supports it (the simdgroup
     // fallback refuses), so it must take any sequence length, not just large ones.
-    if (max_seqlen_q < min_seq && D != 256 && has_bias == 0) return false;
+    if (max_seqlen_q < min_seq && D != 256 && D != 160 && has_bias == 0) return false;
     // Kernel assumes head stride == D (last dim contiguous, heads packed);
     // row stride is passed per-tensor so strided unbind views need no copy.
     if (q.stride(1) != D || k.stride(1) != D || v.stride(1) != D) return false;
@@ -193,7 +196,7 @@ static bool try_mpp_varlen(const at::Tensor& q, const at::Tensor& k, const at::T
     if (const char* e = std::getenv("MTLATTN_TM32_MIN")) tm32_min = atoll(e);
     // head_dim 256 only has a TM=16 kernel (its [32,256] O accumulator can't fit
     // threadgroup memory at TM=32).
-    const bool tm32 = ctx.na_capable && max_seqlen_q >= tm32_min && D != 256;
+    const bool tm32 = ctx.na_capable && max_seqlen_q >= tm32_min && (D == 128 || D == 64 || D == 96);
     const uint32_t TM = tm32 ? 32u : 16u;
     // attn_mpp_varlen_{half|bfloat}[_d64|_d96|_d256][_tm32]  (D=128 has no suffix)
     std::string suffix = (D == 128) ? "" : ("_d" + std::to_string(D));
@@ -284,8 +287,8 @@ at::Tensor varlen_attention(
     const auto H = q.size(1);          // query heads (H_q)
     const auto H_kv = k.size(1);       // kv heads (<= H_q for GQA/MQA)
     const auto D = q.size(2);
-    TORCH_CHECK(D <= HEAD_DIM_MAX || D == 256,
-                "mtlattn: head_dim ", D, " unsupported (expected <= 128, or 256)");
+    TORCH_CHECK(D <= HEAD_DIM_MAX || D == 256 || D == 160,
+                "mtlattn: head_dim ", D, " unsupported (expected <= 128, or 160/256)");
     TORCH_CHECK(v.size(1) == H_kv && k.size(2) == D && v.size(2) == D,
                 "mtlattn: k/v head/dim shape mismatch");
     TORCH_CHECK(H_kv > 0 && H % H_kv == 0,
@@ -336,6 +339,24 @@ at::Tensor varlen_attention(
         bias_hs = (bias_t.size(1) == 1) ? 0u : (uint32_t)bias_t.stride(1);
     } else {
         bias_t = at::empty({1}, q.options().dtype(at::kFloat));
+    }
+
+    // Decode regime (few queries, long KV): the normal forward gives one
+    // threadgroup per (q-tile, seq, head), which at decode (q_len≈1) streams the
+    // whole KV serially and leaves the GPU idle (~1000x below prefill). splitKV
+    // parallelizes the KV — measured 8–20x faster. Gated to what the split kernels
+    // cover (D 64/128, half/bf16, no window/bias). Override: MTLATTN_NO_SPLITKV.
+    if (q.size(0) > 0 && !std::getenv("MTLATTN_NO_MPP") && !std::getenv("MTLATTN_NO_SPLITKV")
+        && !want_bias && window <= 0 && (D == 128 || D == 64) && max_seqlen_q <= 16
+        && (q.scalar_type() == at::kHalf || q.scalar_type() == at::kBFloat16) && num_seqs >= 1) {
+        const int64_t avg_kv = k.size(0) / std::max<int64_t>(1, num_seqs);
+        if (avg_kv >= 2048 && Context::instance().mpp_pipeline("attn_mpp_split_half", false) != nil) {
+            // Splits ≈ keys/512 (each chunk a handful of TN-tiles), capped to bound
+            // total KV-groups (num_seqs·splits) so many sequences don't oversubscribe.
+            int64_t ns = std::max<int64_t>(4, std::min<int64_t>(32, avg_kv / 512));
+            ns = std::min<int64_t>(ns, std::max<int64_t>(2, 1024 / num_seqs));
+            return attn_splitkv(q, k, v, cu_q, cu_kv, max_seqlen_q, scale, causal, ns);
+        }
     }
 
     // Metal 4 MPP fast-path (matmul2d; M5 Neural Accelerator where present,
@@ -462,7 +483,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> varlen_attention_bwd(
     // matmul2d backward (MPP) — ~12x the simdgroup-per-row path. head_dim 128,
     // half/bf16, MPP available. delta is a cheap torch reduction (ordered on the
     // MPS stream); the two matmul2d kernels do dQ and dK/dV.
-    if ((D == 128 || D == 64 || D == 96 || D == 256) && (q.scalar_type() == at::kHalf || q.scalar_type() == at::kBFloat16) &&
+    if ((D == 128 || D == 64 || D == 96 || D == 256 || D == 80 || D == 88 || D == 160) && (q.scalar_type() == at::kHalf || q.scalar_type() == at::kBFloat16) &&
         Context::instance().mpp_library != nil && !std::getenv("MTLATTN_NO_MPP")) {
         auto delta = (dout.to(at::kFloat) * o.to(at::kFloat)).sum(-1).contiguous();  // [total_q, Hq]
         auto cqc = cu_q.to(at::kCPU), ckc = cu_kv.to(at::kCPU);
@@ -659,6 +680,68 @@ static at::Tensor mpp_bwd_dq(
     return dQ;
 }
 
+// splitKV / FlashDecoding: KV-split partial kernel + combine. For decode-shaped
+// inputs (few queries, long KV) where the normal forward underutilizes the GPU.
+// q,k,v: [*,H,D] half/bf16; D in {64,128}; one or more seqs via cu_*.
+static at::Tensor attn_splitkv(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
+                               const at::Tensor& cu_q, const at::Tensor& cu_kv,
+                               int64_t max_seqlen_q, double scale, bool causal, int64_t num_splits) {
+    const auto total_q = q.size(0), H = q.size(1), D = q.size(2), H_kv = k.size(1);
+    TORCH_CHECK(D == 128 || D == 64, "splitkv: D in {64,128} (prototype)");
+    TORCH_CHECK(q.scalar_type() == at::kHalf || q.scalar_type() == at::kBFloat16, "splitkv: half/bf16");
+    const uint32_t g = (uint32_t)(H / H_kv);
+    const int64_t num_seqs = cu_q.numel() - 1;
+    auto& ctx = Context::instance();
+    const bool half = q.scalar_type() == at::kHalf;
+    std::string suf = std::string(half ? "half" : "bfloat") + (D == 128 ? "" : "_d64");
+    auto ps_split = ctx.mpp_pipeline("attn_mpp_split_" + suf, false);
+    auto ps_comb  = ctx.mpp_pipeline("attn_mpp_combine_" + suf, false);
+    TORCH_CHECK(ps_split != nil && ps_comb != nil, "mtlattn: splitkv pipeline unavailable");
+
+    auto out = at::empty({total_q, H, D}, q.options());
+    auto fopt = q.options().dtype(at::kFloat);
+    auto o_partial = at::empty({num_splits, total_q, H, D}, fopt);
+    auto lse_partial = at::empty({num_splits, total_q, H}, fopt);
+    auto cuq = cu_q.contiguous(), cukv = cu_kv.contiguous();
+    uint32_t Hh=(uint32_t)H, ns=(uint32_t)num_splits, tq=(uint32_t)total_q; float sc=(float)scale;
+    uint32_t qrs=(uint32_t)q.stride(0), krs=(uint32_t)k.stride(0), vrs=(uint32_t)v.stride(0);
+    uint32_t caus = causal ? 1u : 0u;
+    uint32_t qtiles = ((uint32_t)max_seqlen_q + 15u) / 16u;
+    auto buf = [](const at::Tensor& t){ return at::native::mps::getMTLBufferStorage(t); };
+    id<MTLBuffer> qb=buf(q),kb=buf(k),vb=buf(v),opb=buf(o_partial),lpb=buf(lse_partial),
+                  cqb=buf(cuq),ckb=buf(cukv),ob=buf(out);
+    NSUInteger es=q.element_size();
+    NSUInteger qo=q.storage_offset()*es,ko=k.storage_offset()*es,vo=v.storage_offset()*es,
+               cqo=cuq.storage_offset()*4,cko=cukv.storage_offset()*4,oo=out.storage_offset()*es;
+    auto* stream = at::mps::getCurrentMPSStream();
+    mps_dispatch_sync(stream->queue(), ^() {
+        @autoreleasepool {
+            stream->endKernelCoalescing();
+            id<MTLComputeCommandEncoder> enc = [stream->commandBuffer() computeCommandEncoder];
+            // partial: grid (q_tiles, num_seqs*num_splits, H)
+            [enc setComputePipelineState:ps_split];
+            [enc setBuffer:qb offset:qo atIndex:0]; [enc setBuffer:kb offset:ko atIndex:1]; [enc setBuffer:vb offset:vo atIndex:2];
+            [enc setBuffer:opb offset:0 atIndex:3]; [enc setBuffer:lpb offset:0 atIndex:4];
+            [enc setBuffer:cqb offset:cqo atIndex:5]; [enc setBuffer:ckb offset:cko atIndex:6];
+            [enc setBytes:&Hh length:4 atIndex:7]; [enc setBytes:&sc length:4 atIndex:8];
+            [enc setBytes:&qrs length:4 atIndex:9]; [enc setBytes:&krs length:4 atIndex:10]; [enc setBytes:&vrs length:4 atIndex:11];
+            [enc setBytes:&caus length:4 atIndex:12]; [enc setBytes:&g length:4 atIndex:13];
+            [enc setBytes:&ns length:4 atIndex:14]; [enc setBytes:&tq length:4 atIndex:15];
+            [enc dispatchThreadgroups:MTLSizeMake(qtiles, (NSUInteger)(num_seqs*num_splits), (NSUInteger)H)
+                threadsPerThreadgroup:MTLSizeMake(ps_split.threadExecutionWidth*4, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            // combine: grid (total_q, H)
+            [enc setComputePipelineState:ps_comb];
+            [enc setBuffer:opb offset:0 atIndex:0]; [enc setBuffer:lpb offset:0 atIndex:1]; [enc setBuffer:ob offset:oo atIndex:2];
+            [enc setBytes:&Hh length:4 atIndex:3]; [enc setBytes:&ns length:4 atIndex:4]; [enc setBytes:&tq length:4 atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)total_q, (NSUInteger)H, 1)
+                threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            [enc endEncoding];
+        }
+    });
+    return out;
+}
+
 }  // namespace
 
 // Diagnostic: is the Metal 4 MPP (matmul2d) fast path usable on this machine?
@@ -670,6 +753,9 @@ static bool mpp_available() {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("mpp_available", &mpp_available, "True if the Metal 4 MPP fast path is usable here");
+    m.def("attn_splitkv", &attn_splitkv, "splitKV / FlashDecoding (test entry)",
+          py::arg("q"), py::arg("k"), py::arg("v"), py::arg("cu_q"), py::arg("cu_kv"),
+          py::arg("max_seqlen_q"), py::arg("scale"), py::arg("causal"), py::arg("num_splits"));
     m.def("mpp_bwd_dkv", &mpp_bwd_dkv, "matmul2d dK/dV backward (test entry)",
           py::arg("q"), py::arg("k"), py::arg("v"), py::arg("dO"), py::arg("lse"), py::arg("delta"),
           py::arg("cu_q"), py::arg("cu_kv"), py::arg("max_seqlen_kv"), py::arg("scale"),

@@ -6,7 +6,8 @@ compute kernel for PyTorch MPS tensors, with online softmax, fp32 accumulation,
 
 Variable-length (`cu_seqlens`) attention is the core; it also does **causal
 masking, GQA/MQA, sliding-window, and arbitrary additive attention bias**
-(prefix-LM / ALiBi / custom masks), and ships a
+(prefix-LM / ALiBi / custom masks), **auto-accelerates decode** (splitKV /
+FlashDecoding — 8–20× on few-query/long-KV generation), and ships a
 `scaled_dot_product_attention` drop-in so existing models use it unchanged.
 
 - **Two runtime paths, selected automatically**: the Metal 4 `matmul2d`
@@ -134,14 +135,17 @@ unavailable or the mask shape can't be mapped. The crossover length is
 `replace_sdpa(min_seqlen=...)`. `mtlattn.sdpa(...)` is the same adapter callable
 directly.
 
-**head_dim**: 64/96/128/256 run on the accelerator (MPP) path; any other
-`head_dim ≤ 128` runs on the portable simdgroup kernel; `head_dim` 256 needs the
-MPP path (macOS 26.2+). **Differentiable** — if `q`/`k`/`v` require grad,
-`varlen_attention` routes through the backward kernel (training), composing
-with causal / GQA / sliding-window; otherwise it uses the fast inference path.
-The backward is a simdgroup-per-row kernel (32 lanes cooperate on head_dim via
-`simd_sum`), ~3.5× the forward; a fully simdgroup-matrix-tiled backward is
-possible future work.
+**head_dim**: 64/80/88/96/128/160/256 run on the accelerator (MPP) path
+(`matmul2d` is dimension-general, so the non-32-multiple dims used by some image
+models — SD1.5 / Hunyuan DiT 80/88, SD1.5 160 — get the fast path too, ~7× the
+simdgroup kernel); any other `head_dim ≤ 128` runs on the portable simdgroup
+kernel; `head_dim` 160/256 need the MPP path (macOS 26.2+). **Differentiable** —
+if `q`/`k`/`v` require grad, `varlen_attention` routes through the backward
+kernel (training), composing with causal / GQA / sliding-window / additive mask;
+otherwise it uses the fast inference path. On the MPP path the backward also runs
+on `matmul2d` (two flash-attn-2 kernels: a per-Q-block dQ and a per-KV-block
+dK/dV); it's the slower half (~5.8 vs ~9.5 TF on M5) but still ~11× the
+simdgroup-per-row fallback used on M1/M2.
 
 Runnable tour of all of the above: [`examples/quickstart.py`](examples/quickstart.py).
 

@@ -355,8 +355,184 @@ INSTANTIATE_MPP_VL(attn_mpp_varlen_half_d96,        half,   16, 96)
 INSTANTIATE_MPP_VL(attn_mpp_varlen_half_d96_tm32,   half,   32, 96)
 INSTANTIATE_MPP_VL(attn_mpp_varlen_bfloat_d96,      bfloat, 16, 96)
 INSTANTIATE_MPP_VL(attn_mpp_varlen_bfloat_d96_tm32, bfloat, 32, 96)
+// Non-32-multiple head dims used by real image models (SD1.5 / Hunyuan DiT
+// use 80/88). matmul2d is dimension-general; these would otherwise fall to the
+// ~8x-slower simdgroup path. TM=16 only (these models run below the tm32 gate).
+INSTANTIATE_MPP_VL(attn_mpp_varlen_half_d80,        half,   16, 80)
+INSTANTIATE_MPP_VL(attn_mpp_varlen_bfloat_d80,      bfloat, 16, 80)
+INSTANTIATE_MPP_VL(attn_mpp_varlen_half_d88,        half,   16, 88)
+INSTANTIATE_MPP_VL(attn_mpp_varlen_bfloat_d88,      bfloat, 16, 88)
+INSTANTIATE_MPP_VL(attn_mpp_varlen_half_d160,       half,   16, 160)
+INSTANTIATE_MPP_VL(attn_mpp_varlen_bfloat_d160,     bfloat, 16, 160)
 INSTANTIATE_MPP_VL(attn_mpp_varlen_half_d256,       half,   16, 256)
 INSTANTIATE_MPP_VL(attn_mpp_varlen_bfloat_d256,     bfloat, 16, 256)
+
+
+// ============================================================================
+// splitKV / FlashDecoding — for the decode regime (few queries, long KV).
+//
+// The normal forward gives one threadgroup per (q-tile, seq, head); at decode
+// (q_len≈1) that's only ~num_seqs*H threadgroups streaming the whole KV serially
+// — the GPU sits idle (~1000x below prefill efficiency). splitKV adds a KV-split
+// grid dimension: each threadgroup attends only its KV chunk and writes a
+// NORMALIZED partial output + that chunk's LSE. A tiny combine kernel then merges
+// the splits per (query, head) via the online-softmax identity
+//   O = Σ_s O_s · exp(lse_s − m) / Σ_s exp(lse_s − m),   m = max_s lse_s.
+// This is the same fp16/bf16 matmul2d chain as attn_vl, just KV-range-bounded
+// and writing to partial buffers. Causal + GQA (decode's regime); no bias/window.
+// ============================================================================
+template <typename T, int TM, int TN, int D, int SG>
+inline void attn_vl_split(device const T* Q, device const T* K, device const T* V,
+                          device float* o_partial, device float* lse_partial,
+                          device const int* cu_q, device const int* cu_kv, uint H, float scale,
+                          uint q_rs, uint k_rs, uint v_rs, uint causal, uint g,
+                          uint num_splits, uint total_q,
+                          threadgroup float* Sb, threadgroup T* Pb, threadgroup float* Ob,
+                          threadgroup float* mb, threadgroup float* lb, threadgroup float* cb,
+                          uint tid, uint qtile, uint seqsplit, uint head)
+{
+    using HT  = tensor<device T, dextents<int32_t, 2>, tensor_inline>;
+    using TGSf = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>;
+    using TGSh = tensor<threadgroup T,  dextents<int32_t, 2>, tensor_inline>;
+    constexpr uint NT = SG * 32;
+    const uint seq = seqsplit / num_splits, split = seqsplit % num_splits;
+    const int qrs = int(q_rs), krs = int(k_rs), vrs = int(v_rs);
+    const int ho_q = int(head * D), ho_kv = int((head / g) * D);
+    const int q_start = cu_q[seq], q_end = cu_q[seq + 1];
+    const int kv_start = cu_kv[seq], kv_end = cu_kv[seq + 1];
+    const int q0 = q_start + int(qtile) * TM;
+    if (q0 >= q_end) return;
+    const int q_cnt = min(TM, q_end - q0);
+    const int kv_len = kv_end - kv_start;
+    const int coff = kv_len - (q_end - q_start);
+    // This split's KV range (chunk aligned to TN so tiles stay full).
+    int chunk = (kv_len + int(num_splits) - 1) / int(num_splits);
+    chunk = ((chunk + TN - 1) / TN) * TN;
+    const int my0 = kv_start + int(split) * chunk;
+    const int my_end = min(my0 + chunk, kv_end);
+    thread array<int32_t, 2> stq = {1, qrs}, stk = {1, krs}, stv = {1, vrs};
+
+    HT tQ((device T*)Q + ulong(q0) * qrs + ho_q, dextents<int32_t, 2>(D, q_cnt), stq);
+    TGSf tS(Sb, dextents<int32_t, 2>(TN, TM));
+    TGSh tP(Pb, dextents<int32_t, 2>(TN, TM));
+    TGSf tOb(Ob, dextents<int32_t, 2>(D, TM));
+
+    for (uint i = tid; i < TM * D; i += NT) Ob[i] = 0.0f;
+    for (uint r = tid; r < TM; r += NT) { mb[r] = -INFINITY; lb[r] = 0.0f; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int q_hi = (q0 - q_start) + (q_cnt - 1) + coff;
+    const float scl = scale * 1.4426950408889634f;
+    for (int kv = my0; kv < my_end; kv += TN) {
+        if (causal && (kv - kv_start) > q_hi) break;
+        int tk = min(TN, my_end - kv);
+        const int kvbase = kv - kv_start;
+        HT tK((device T*)K + ulong(kv) * krs + ho_kv, dextents<int32_t, 2>(D, tk), stk);
+        HT tV((device T*)V + ulong(kv) * vrs + ho_kv, dextents<int32_t, 2>(D, tk), stv);
+        { constexpr auto d = matmul2d_descriptor(TM, TN, static_cast<int>(dynamic_extent), false, true, false);
+          matmul2d<d, execution_simdgroups<SG>> op;
+          auto a = tQ.slice(0, 0); auto b = tK.slice(0, 0); auto c = tS.slice(0, 0); op.run(a, b, c); }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        constexpr uint LPR = 2u;
+        const uint row = tid / LPR, sub = tid % LPR;
+        if (row < uint(TM)) {
+            int lim = tk;
+            if (causal) { int h = (q0 - q_start) + int(row) + coff - kvbase + 1; lim = clamp(h, 0, tk); }
+            const float m_old = mb[row];
+            float rawmax = -INFINITY;
+            for (uint c = sub; c < uint(TN); c += LPR) if (int(c) < lim) rawmax = max(rawmax, Sb[row*TN+c]);
+            for (uint o = 1; o < LPR; o <<= 1) rawmax = max(rawmax, simd_shuffle_xor(rawmax, o));
+            const float tmax = (rawmax == -INFINITY) ? m_old : max(m_old, rawmax * scl);
+            const float corr = (tmax == -INFINITY) ? 1.0f : exp2(m_old - tmax);
+            float tsum = 0.0f;
+            for (uint c = sub; c < uint(TN); c += LPR) {
+                float w = (int(c) < lim) ? exp2(Sb[row*TN+c]*scl - tmax) : 0.0f;
+                tsum += w; Pb[row*TN+c] = T(w);
+            }
+            for (uint o = 1; o < LPR; o <<= 1) tsum += simd_shuffle_xor(tsum, o);
+            if (sub == 0) { mb[row] = tmax; lb[row] = lb[row]*corr + tsum; cb[row] = corr; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = tid; i < TM * D; i += NT) Ob[i] *= cb[i / D];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        { constexpr auto d = matmul2d_descriptor(TM, D, static_cast<int>(dynamic_extent), false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+          matmul2d<d, execution_simdgroups<SG>> op;
+          auto a = tP.slice(0, 0); auto b = tV.slice(0, 0); auto c = tOb.slice(0, 0); op.run(a, b, c); }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // Write this split's NORMALIZED partial O and its LSE (-inf if it saw no keys).
+    for (uint r = tid; r < TM; r += NT) {
+        if (int(r) >= q_cnt) continue;
+        const float l = lb[r];
+        const float inv = (l > 0.0f) ? 1.0f/l : 0.0f;
+        const ulong pbase = (ulong(split) * total_q + ulong(q0 + int(r))) * H + head;
+        for (uint dd = 0; dd < D; ++dd) o_partial[pbase * D + dd] = Ob[r*D+dd] * inv;
+        lse_partial[pbase] = (l > 0.0f) ? (mb[r] * 0.69314718055994531f + log(l)) : -INFINITY;
+    }
+}
+
+#define INSTANTIATE_SPLIT(NAME, T, D_)                                          \
+kernel void NAME(                                                               \
+    device const T* Q [[buffer(0)]], device const T* K [[buffer(1)]], device const T* V [[buffer(2)]], \
+    device float* o_partial [[buffer(3)]], device float* lse_partial [[buffer(4)]], \
+    device const int* cu_q [[buffer(5)]], device const int* cu_kv [[buffer(6)]], \
+    constant uint& H [[buffer(7)]], constant float& scale [[buffer(8)]],        \
+    constant uint& q_rs [[buffer(9)]], constant uint& k_rs [[buffer(10)]], constant uint& v_rs [[buffer(11)]], \
+    constant uint& causal [[buffer(12)]], constant uint& g [[buffer(13)]],      \
+    constant uint& num_splits [[buffer(14)]], constant uint& total_q [[buffer(15)]], \
+    uint tid [[thread_index_in_threadgroup]], uint3 tgid [[threadgroup_position_in_grid]]) \
+{                                                                               \
+    constexpr int TM=16,TN=48,D=D_,SG=4;                                        \
+    threadgroup float Sb[TM*TN]; threadgroup T Pb[TM*TN]; threadgroup float Ob[TM*D]; \
+    threadgroup float mb[TM], lb[TM], cb[TM];                                   \
+    attn_vl_split<T,TM,TN,D,SG>(Q,K,V,o_partial,lse_partial,cu_q,cu_kv,H,scale,q_rs,k_rs,v_rs,causal,g,num_splits,total_q,Sb,Pb,Ob,mb,lb,cb,tid,tgid.x,tgid.y,tgid.z); \
+}
+INSTANTIATE_SPLIT(attn_mpp_split_half,        half,   128)
+INSTANTIATE_SPLIT(attn_mpp_split_bfloat,      bfloat, 128)
+INSTANTIATE_SPLIT(attn_mpp_split_half_d64,    half,   64)
+INSTANTIATE_SPLIT(attn_mpp_split_bfloat_d64,  bfloat, 64)
+
+// Combine the splits per (query, head): online-softmax weighted merge. Grid
+// (total_q, H); D threads reduce the partials. o_partial/lse_partial are
+// [num_splits, total_q, H, *]; out is [total_q, H, D] in the input dtype.
+template <typename T, int D>
+inline void attn_combine(device const float* o_partial, device const float* lse_partial,
+                         device T* O, uint H, uint num_splits, uint total_q,
+                         uint q, uint head, uint tid, uint nthreads)
+{
+    const ulong base = ulong(q) * H + head;          // (q,head) slot stride is over splits
+    float m = -INFINITY;
+    for (uint s = 0; s < num_splits; ++s) m = max(m, lse_partial[(ulong(s) * total_q) * H + base]);
+    float wsum = 0.0f;
+    for (uint s = 0; s < num_splits; ++s) {
+        float ls = lse_partial[(ulong(s) * total_q) * H + base];
+        wsum += (ls == -INFINITY) ? 0.0f : exp(ls - m);
+    }
+    const float inv = (wsum > 0.0f) ? 1.0f/wsum : 0.0f;
+    for (uint dd = tid; dd < uint(D); dd += nthreads) {
+        float acc = 0.0f;
+        for (uint s = 0; s < num_splits; ++s) {
+            float ls = lse_partial[(ulong(s) * total_q) * H + base];
+            float w = (ls == -INFINITY) ? 0.0f : exp(ls - m);
+            acc += w * o_partial[((ulong(s) * total_q) * H + base) * D + dd];
+        }
+        O[base * D + dd] = T(acc * inv);
+    }
+}
+
+#define INSTANTIATE_COMBINE(NAME, T, D_)                                        \
+kernel void NAME(                                                               \
+    device const float* o_partial [[buffer(0)]], device const float* lse_partial [[buffer(1)]], \
+    device T* O [[buffer(2)]], constant uint& H [[buffer(3)]],                  \
+    constant uint& num_splits [[buffer(4)]], constant uint& total_q [[buffer(5)]], \
+    uint tid [[thread_index_in_threadgroup]], uint2 tgid [[threadgroup_position_in_grid]]) \
+{                                                                               \
+    attn_combine<T, D_>(o_partial, lse_partial, O, H, num_splits, total_q, tgid.x, tgid.y, tid, 64); \
+}
+INSTANTIATE_COMBINE(attn_mpp_combine_half,       half,   128)
+INSTANTIATE_COMBINE(attn_mpp_combine_bfloat,     bfloat, 128)
+INSTANTIATE_COMBINE(attn_mpp_combine_half_d64,   half,   64)
+INSTANTIATE_COMBINE(attn_mpp_combine_bfloat_d64, bfloat, 64)
 
 
 // ============================================================================
@@ -493,6 +669,12 @@ INSTANTIATE_BWD_DKV(attn_mpp_bwd_dkv_half_d64,   half,   32, 16, 64)
 INSTANTIATE_BWD_DKV(attn_mpp_bwd_dkv_bfloat_d64, bfloat, 32, 16, 64)
 INSTANTIATE_BWD_DKV(attn_mpp_bwd_dkv_half_d96,   half,   32, 16, 96)
 INSTANTIATE_BWD_DKV(attn_mpp_bwd_dkv_bfloat_d96, bfloat, 32, 16, 96)
+INSTANTIATE_BWD_DKV(attn_mpp_bwd_dkv_half_d80,   half,   32, 16, 80)
+INSTANTIATE_BWD_DKV(attn_mpp_bwd_dkv_bfloat_d80, bfloat, 32, 16, 80)
+INSTANTIATE_BWD_DKV(attn_mpp_bwd_dkv_half_d88,   half,   32, 16, 88)
+INSTANTIATE_BWD_DKV(attn_mpp_bwd_dkv_bfloat_d88, bfloat, 32, 16, 88)
+INSTANTIATE_BWD_DKV(attn_mpp_bwd_dkv_half_d160,   half,   32, 16, 160)
+INSTANTIATE_BWD_DKV(attn_mpp_bwd_dkv_bfloat_d160, bfloat, 32, 16, 160)
 INSTANTIATE_BWD_DKV(attn_mpp_bwd_dkv_half_d256,   half,   32, 8, 256)   // BK=8: [BK,256] dK/dV tight
 INSTANTIATE_BWD_DKV(attn_mpp_bwd_dkv_bfloat_d256, bfloat, 32, 8, 256)
 
@@ -607,6 +789,12 @@ INSTANTIATE_BWD_DQ(attn_mpp_bwd_dq_half_d64,   half,   32, 16, 64)
 INSTANTIATE_BWD_DQ(attn_mpp_bwd_dq_bfloat_d64, bfloat, 32, 16, 64)
 INSTANTIATE_BWD_DQ(attn_mpp_bwd_dq_half_d96,   half,   32, 16, 96)
 INSTANTIATE_BWD_DQ(attn_mpp_bwd_dq_bfloat_d96, bfloat, 32, 16, 96)
+INSTANTIATE_BWD_DQ(attn_mpp_bwd_dq_half_d80,   half,   32, 16, 80)
+INSTANTIATE_BWD_DQ(attn_mpp_bwd_dq_bfloat_d80, bfloat, 32, 16, 80)
+INSTANTIATE_BWD_DQ(attn_mpp_bwd_dq_half_d88,   half,   32, 16, 88)
+INSTANTIATE_BWD_DQ(attn_mpp_bwd_dq_bfloat_d88, bfloat, 32, 16, 88)
+INSTANTIATE_BWD_DQ(attn_mpp_bwd_dq_half_d160,   half,   32, 16, 160)
+INSTANTIATE_BWD_DQ(attn_mpp_bwd_dq_bfloat_d160, bfloat, 32, 16, 160)
 INSTANTIATE_BWD_DQ(attn_mpp_bwd_dq_half_d256,   half,   16, 8, 256)   // BQ=16: [BQ,256] dQ tight
 INSTANTIATE_BWD_DQ(attn_mpp_bwd_dq_bfloat_d256, bfloat, 16, 8, 256)
 

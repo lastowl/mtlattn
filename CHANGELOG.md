@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+- **splitKV / FlashDecoding — decode is now 8–20× faster.** At decode (few
+  queries against a long KV cache) the normal forward gives one threadgroup per
+  (seq, head), each streaming the whole cache serially — ~1000× below prefill
+  efficiency (~7 GFLOP/s). splitKV adds a KV-split grid dimension: each
+  threadgroup attends only its KV chunk and writes a normalized partial output +
+  LSE, then a tiny combine kernel merges the splits via the online-softmax
+  identity. `varlen_attention` **auto-detects** decode shapes (small
+  `max_seqlen_q`, long KV, D 64/128, half/bf16, no window/bias) and routes them
+  through it; prefill/training are unchanged. Measured on M5: B=1/KV=8192
+  7.06→0.47 ms (15×), B=1/KV=16384 13.9→0.69 ms (20×), B=8/KV=8192 16.9→1.87 ms
+  (9×). Exact vs the reference (relerr ~3e-5). Override with `MTLATTN_NO_SPLITKV`.
+- **head_dim 80, 88, 160 on the accelerator (MPP) path** — `matmul2d` is
+  dimension-general, so these non-32-multiple dims (SD1.5 / Hunyuan DiT use
+  80/88; SD1.5 uses 160) no longer fall to the ~8×-slower simdgroup path. 80/88
+  go from ~1.1 TF → ~8 TF (≈7×); 160 previously **errored entirely** and now runs
+  at ~9 TF. Forward + backward, fp16/bf16, validated against the fp32 reference.
+  head_dim coverage on MPP is now 64/80/88/96/128/160/256.
+- Verified the matmul2d **backward is already at its tile optimum** — smaller
+  tiles (dq BQ 32→16, dkv BK 16→8) were *slower*, matching the docs' finding that
+  bigger tiles also lose. The ~5.8 TF is structural (2.5× the forward's FLOPs +
+  accumulator occupancy), not a missed optimization.
+
 ## 0.3.0 (2026-06-17)
 
 Headline: **arbitrary additive attention masks** (prefix-LM / ALiBi / custom

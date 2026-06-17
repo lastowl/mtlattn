@@ -335,9 +335,27 @@ def main():
     results.append(run_case("D=64 MPP SWA", [2048], [2048], 12, 64, torch.float16, 5e-3, causal=True, window=128))
     results.append(run_case("D=96 MPP causal", [2048], [2048], 12, 96, torch.float16, 5e-3, causal=True))
     results.append(run_case("D=96 MPP bf16", [1500], [1500], 8, 96, torch.bfloat16, 3e-2))
+    # head_dim 80/88 (SD1.5 / Hunyuan DiT) — non-32-multiple dims on the MPP path
+    # (was the ~8x-slower simdgroup path before they were added).
+    results.append(run_case("D=80 MPP", [2048], [2048], 8, 80, torch.float16, 5e-3))
+    results.append(run_case("D=80 MPP causal", [1500], [1500], 12, 80, torch.float16, 5e-3, causal=True))
+    results.append(run_case("D=88 MPP", [2048], [2048], 8, 88, torch.float16, 5e-3))
+    results.append(run_case("D=88 MPP bf16 causal", [1500], [1500], 8, 88, torch.bfloat16, 3e-2, causal=True))
+
+    # splitKV / decode (few queries, long KV) — varlen_attention auto-routes these
+    # through the split+combine kernels; validated end-to-end vs the fp32 reference.
+    results.append(run_case("decode B1 kv8192", [1], [8192], 12, 128, torch.float16, 5e-3, causal=True))
+    results.append(run_case("decode B1 noncausal", [1], [8192], 8, 128, torch.float16, 5e-3))
+    results.append(run_case("decode B4 ragged", [1, 1, 1, 1], [8192, 4000, 6000, 2048], 8, 128, torch.float16, 5e-3, causal=True))
+    results.append(run_case("decode B1 D64", [1], [4096], 8, 64, torch.float16, 5e-3, causal=True))
+    results.append(run_case("decode bf16", [1], [5000], 8, 128, torch.bfloat16, 3e-2, causal=True))
+    results.append(run_gqa_case("decode GQA B1", [1], [8192], 8, 2, 128, torch.float16, 5e-3, causal=True))
+    results.append(run_case("decode few-q (spec)", [4], [8000], 8, 128, torch.float16, 5e-3, causal=True))
     # head_dim > 128 (256) — MPP-only (no simdgroup kernel that large), so only
     # exercise it where the MPP path is available (macOS 26.2+, not MTLATTN_NO_MPP).
     if mtlattn._C.mpp_available() and not os.environ.get("MTLATTN_NO_MPP"):
+        results.append(run_case("D=160 MPP full", [2048], [2048], 8, 160, torch.float16, 5e-3))
+        results.append(run_case("D=160 MPP causal", [1500], [1500], 12, 160, torch.float16, 5e-3, causal=True))
         results.append(run_case("D=256 MPP full", [2048], [2048], 8, 256, torch.float16, 5e-3))
         results.append(run_case("D=256 MPP causal", [1024], [1024], 12, 256, torch.float16, 5e-3, causal=True))
         results.append(run_case("D=256 MPP bf16", [1500], [1500], 8, 256, torch.bfloat16, 4e-2, causal=True))
@@ -382,7 +400,10 @@ def main():
     results.append(run_bwd_case("bwd bf16 varlen", [180, 90], [180, 90], 8, 8, 128, torch.bfloat16, 4e-2, causal=True))
     results.append(run_bwd_case("bwd fp16 D=64", [200, 50], [200, 50], 8, 8, 64, torch.float16, 5e-3, causal=True))
     results.append(run_bwd_case("bwd fp16 D=96 GQA", [256], [256], 8, 2, 96, torch.float16, 6e-3, causal=True))
+    results.append(run_bwd_case("bwd fp16 D=80", [256], [256], 8, 8, 80, torch.float16, 6e-3, causal=True))
+    results.append(run_bwd_case("bwd fp16 D=88 GQA", [200, 56], [200, 56], 8, 2, 88, torch.float16, 6e-3, causal=True))
     if mtlattn._C.mpp_available() and not os.environ.get("MTLATTN_NO_MPP"):
+        results.append(run_bwd_case("bwd fp16 D=160", [512], [512], 8, 8, 160, torch.float16, 6e-3, causal=True))
         results.append(run_bwd_case("bwd fp16 D=256", [512], [512], 8, 8, 256, torch.float16, 6e-3, causal=True))
 
     # Arbitrary additive attn_mask (MPP-only). Forward + backward, per-head and
