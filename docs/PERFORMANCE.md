@@ -211,12 +211,17 @@ ALU). Prior art agrees on the magnitude — SageAttention/Draw Things realize on
 
 ## Remaining headroom (all large/uncertain)
 
-1. **Manual register-resident softmax** (cooperative-tensor scores + hand-rolled
-   cross-simdgroup reduction, since `reduce_rows` is out) — could shave the
-   forward's threadgroup round-trip, but high occupancy/correctness risk.
-2. **One-pass fused backward** — major rewrite, uncertain payoff.
-3. **int8 (Hadamard-rotated per-row QK + more occupancy work)** — ~1.3× ceiling,
+1. **One-pass fused backward** — major rewrite, uncertain payoff.
+2. **int8 (Hadamard-rotated per-row QK + more occupancy work)** — ~1.3× ceiling,
    parked on `experiments/int8-attention`; revisit only if fp16 is exhausted.
+
+**Register-resident softmax: tried and SHELVED (measured 3× slower).** Building the
+MLX NAX-style version (scores + O in register cooperative tensors, manual
+`simd_shuffle_xor` butterfly instead of `reduce_rows`) was correct but **3× slower**
+— the register O accumulator collapses occupancy. This proved the forward's
+threadgroup "round-trip" is *not* the bottleneck; **occupancy is**, which is exactly
+why the threadgroup design wins. Parked on `experiments/register-resident`. See
+`EXPERIMENTS.md` for the full catalog of shelved explorations.
 
 Otherwise: the kernels are near their practical limits for the
 `matmul2d`-with-threadgroup structure on current hardware. The easy wins are gone.
