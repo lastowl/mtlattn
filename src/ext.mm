@@ -7,6 +7,7 @@
 
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
+#import <IOKit/IOKitLib.h>
 #import <ATen/mps/MPSStream.h>
 #include <torch/extension.h>
 #include <dlfcn.h>
@@ -60,6 +61,7 @@ struct Context {
     id<MTLLibrary> library = nil;
     id<MTLLibrary> mpp_library = nil;  // optional Metal 4 MPP path (any GPU on macOS 26.2+)
     bool na_capable = false;           // Apple10+ (M5+): has the per-core Neural Accelerator
+    int gpu_cores = 0;                 // GPU core count (IORegistry); 0 if unknown
     std::unordered_map<std::string, id<MTLComputePipelineState>> cache;
 
     static Context& instance() {
@@ -75,6 +77,27 @@ struct Context {
         // bandwidth-bound at long sequences (TM=32 wins there), but on M3/M4 the
         // regular matrix units stay compute-bound, so TM=16 wins at every size.
         na_capable = [device supportsFamily:(MTLGPUFamily)1010];
+
+        // GPU core count (IORegistry AGXAccelerator 'gpu-core-count') — lets the
+        // dispatch heuristics scale across the family (M5 base/Pro/Max differ in
+        // cores) instead of being tuned for one chip. 0 if unavailable.
+        @autoreleasepool {
+            io_iterator_t it = 0;
+            if (IOServiceGetMatchingServices(0, IOServiceMatching("AGXAccelerator"), &it) == KERN_SUCCESS) {
+                io_object_t obj;
+                while ((obj = IOIteratorNext(it))) {
+                    CFTypeRef p = IORegistryEntryCreateCFProperty(obj, CFSTR("gpu-core-count"), kCFAllocatorDefault, 0);
+                    if (p) {
+                        if (CFGetTypeID(p) == CFNumberGetTypeID())
+                            CFNumberGetValue((CFNumberRef)p, kCFNumberIntType, &gpu_cores);
+                        CFRelease(p);
+                    }
+                    IOObjectRelease(obj);
+                    if (gpu_cores) break;
+                }
+                IOObjectRelease(it);
+            }
+        }
 
         NSString* dir = nil;
         @autoreleasepool {
@@ -351,10 +374,17 @@ at::Tensor varlen_attention(
         && (q.scalar_type() == at::kHalf || q.scalar_type() == at::kBFloat16) && num_seqs >= 1) {
         const int64_t avg_kv = k.size(0) / std::max<int64_t>(1, num_seqs);
         if (avg_kv >= 2048 && Context::instance().mpp_pipeline("attn_mpp_split_half", false) != nil) {
-            // Splits ≈ keys/512 (each chunk a handful of TN-tiles), capped to bound
-            // total KV-groups (num_seqs·splits) so many sequences don't oversubscribe.
-            int64_t ns = std::max<int64_t>(4, std::min<int64_t>(32, avg_kv / 512));
-            ns = std::min<int64_t>(ns, std::max<int64_t>(2, 1024 / num_seqs));
+            // Core-count-aware split choice so decode scales across the M5 family
+            // (base/Pro/Max differ in cores), not just the Pro it was tuned on.
+            // Take the max of: chunk-driven (≈ keys/512, the serial-depth driver)
+            // and fill-driven (enough KV-groups to cover this GPU's cores). Cap by
+            // a min chunk (~256 keys) and a total-groups budget (cores·50, which
+            // ≈ the old fixed 1024 at the Pro's 20 cores). Pro-like fallback if the
+            // core count is unknown.
+            const int64_t cores = Context::instance().gpu_cores > 0 ? Context::instance().gpu_cores : 20;
+            int64_t ns = std::max<int64_t>(avg_kv / 512, (cores * 6) / std::max<int64_t>(1, num_seqs * (int64_t)H));
+            ns = std::max<int64_t>(4, std::min<int64_t>(ns, std::max<int64_t>(4, avg_kv / 256)));
+            ns = std::min<int64_t>(ns, std::max<int64_t>(2, cores * 50 / num_seqs));
             return attn_splitkv(q, k, v, cu_q, cu_kv, max_seqlen_q, scale, causal, ns);
         }
     }
@@ -753,6 +783,7 @@ static bool mpp_available() {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("mpp_available", &mpp_available, "True if the Metal 4 MPP fast path is usable here");
+    m.def("gpu_core_count", []{ return Context::instance().gpu_cores; }, "GPU core count (0 if unknown)");
     m.def("attn_splitkv", &attn_splitkv, "splitKV / FlashDecoding (test entry)",
           py::arg("q"), py::arg("k"), py::arg("v"), py::arg("cu_q"), py::arg("cu_kv"),
           py::arg("max_seqlen_q"), py::arg("scale"), py::arg("causal"), py::arg("num_splits"));

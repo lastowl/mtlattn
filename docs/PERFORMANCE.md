@@ -83,6 +83,23 @@ Backward (`bwd_dq_mpp` / `bwd_dkv_mpp`, MPP):
   drops to BK=8 / BQ=16 (the `[·,256]` accumulators are threadgroup-tight).
 - `delta = Σ_d dO·O` is a torch reduction (ordered on the MPS stream).
 
+Decode (splitKV / FlashDecoding, auto-dispatched when `max_seqlen_q ≤ 16` and
+`avg_kv ≥ 2048`):
+- **`num_splits` is core-count-aware** (`Context::gpu_cores`, read once from the
+  IORegistry `AGXAccelerator` `gpu-core-count`). It's the max of a *chunk-driven*
+  term (`avg_kv/512`, the serial-depth driver) and a *fill-driven* term
+  (`cores·6 / (num_seqs·H)`, enough KV-groups to cover this GPU), clamped to a min
+  chunk (~256 keys) and a total-groups budget (`cores·50`). Falls back to 20 cores
+  if the count is unavailable.
+- **Why core-aware:** the old fixed `avg_kv/512` (capped `1024/num_seqs`) under-split
+  short-KV decode on every chip. Measured `B1/Lkv=2048`: M5 Pro (20 cores)
+  **0.121 → 0.051 ms** picking 8 splits not 4 (2.4×); M4 (10 cores)
+  **0.206 → 0.157 ms** picking 5 (1.3×). The per-chip optimum *differs* (Pro wants
+  8, M4 wants 5) — a fixed constant can't be right for both, and a bigger chip
+  (M5 Max) wants still more. Long-KV points are chunk-limited and unchanged.
+- The split count is verified per-chip: read the actual `gpu_core_count()` (Pro=20,
+  M4=10) rather than inferring from the family.
+
 Simdgroup fallback (`attn_mpp.metal` → no; `attention.metal`):
 - v3 register-resident kernel for head_dim 128 (`thread_elements()` + the measured
   8×8 fragment layout: lane holds 2 elements of one row;

@@ -129,6 +129,7 @@ ext = LazyMetalExtension(
     extra_link_args=[
         "-framework", "Metal",
         "-framework", "Foundation",
+        "-framework", "IOKit",
         # Weak-link: the MPP usage lives in the metal4.0 metallib, not this
         # .mm, so weak-linking lets the extension load on macOS < 26 (M1-M4)
         # where this framework is absent; the MPP path stays runtime-gated.

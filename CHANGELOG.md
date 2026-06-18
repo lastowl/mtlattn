@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.4.0 (2026-06-18)
+
+Headline: **decode acceleration** — splitKV / FlashDecoding (8–20× faster decode)
+with core-count-aware split scaling, plus head_dim 80/88/160 on the accelerator
+path. All hardware-validated on M5 (Pro) and M4.
+
 - **splitKV / FlashDecoding — decode is now 8–20× faster.** At decode (few
   queries against a long KV cache) the normal forward gives one threadgroup per
   (seq, head), each streaming the whole cache serially — ~1000× below prefill
@@ -13,6 +19,17 @@
   through it; prefill/training are unchanged. Measured on M5: B=1/KV=8192
   7.06→0.47 ms (15×), B=1/KV=16384 13.9→0.69 ms (20×), B=8/KV=8192 16.9→1.87 ms
   (9×). Exact vs the reference (relerr ~3e-5). Override with `MTLATTN_NO_SPLITKV`.
+- **Core-count-aware decode splits** — the splitKV `num_splits` heuristic now
+  reads the GPU's actual core count (IORegistry `AGXAccelerator` `gpu-core-count`,
+  exposed as `mtlattn._C.gpu_core_count()`) and scales the split count to fill
+  *this* GPU, rather than a single constant tuned for the M5 Pro. The old fixed
+  `avg_kv/512` (cap `1024/num_seqs`) under-split short-KV decode on every chip, and
+  the per-chip optimum genuinely differs (M5 Pro = 20 cores wants 8 splits; M4 = 10
+  cores wants 5). Now `num_splits = max(avg_kv/512, cores·6/(num_seqs·H))`, clamped
+  to a min chunk (~256 keys) and a `cores·50` total-groups budget. Measured
+  `B1/Lkv=2048`: M5 Pro 0.121→0.051 ms (2.4×), M4 0.206→0.157 ms (1.3×); long-KV
+  decode is chunk-limited and unchanged. Bigger chips (M5 Max) get proportionally
+  more splits. Correctness unchanged on M5 and M4.
 - **head_dim 80, 88, 160 on the accelerator (MPP) path** — `matmul2d` is
   dimension-general, so these non-32-multiple dims (SD1.5 / Hunyuan DiT use
   80/88; SD1.5 uses 160) no longer fall to the ~8×-slower simdgroup path. 80/88
