@@ -54,6 +54,27 @@ simdgroup-per-row backward** (apples-to-apples, same session).
 - **Backward** ≈ 5.8 TF — the **slower half**, occupancy-bound. It recomputes
   S=Q·Kᵀ and re-reads Q/dO per KV-block, but bigger tiles (to cut re-reads)
   *lose* to occupancy, so it's tuned to BK=16/BQ=32.
+- **Decode (splitKV)** — latency/**bandwidth**-bound, not compute-bound, so it's
+  measured against the memory-bandwidth floor (time to read K+V once at ~269 GB/s)
+  rather than TFLOPS. M5 Pro (20 cores), fp16, H=12, D=128, split count from the
+  core-aware heuristic:
+
+  | shape | splits | latency | BW floor | % of floor |
+  |---|---|---|---|---|
+  | B1/KV2048  |  8 | 0.10 ms | 0.047 ms | ~49% |
+  | B1/KV4096  | 10 | 0.13 ms | 0.094 ms | ~70% |
+  | B1/KV8192  | 16 | 0.24 ms | 0.187 ms | ~77% |
+  | B1/KV16384 | 32 | 0.46 ms | 0.374 ms | ~81% |
+  | B8/KV8192  | 16 | 1.65 ms | 1.50 ms  | ~91% |
+
+  Efficiency climbs with KV length / batch as the fixed launch + combine overhead
+  amortizes; where data movement dominates it runs at **~77–91% of the DRAM
+  ceiling**. Short single-sequence decode is overhead-dominated (the kernel is
+  smaller than its launch cost), so its % understates the small remaining headroom.
+  Absolute sub-ms latencies are clock-ramp-sensitive — **% of floor is the stable
+  metric**. Pre-splitKV this regime ran ~7 GFLOP/s (~1000× below prefill); 0.4.0
+  made it bandwidth-bound, and the core-aware splits keep each chip near *its own*
+  ceiling (M4 = 10 cores, a future M5 Max = more) instead of the Pro's tuning.
 
 ## Tuning constants (and why)
 
