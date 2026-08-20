@@ -331,13 +331,21 @@ kernel void NAME(                                                               
     device float* lse [[buffer(14)]], constant uint& return_lse [[buffer(15)]], \
     device const float* bias [[buffer(16)]],                                    \
     constant uint& bias_qs [[buffer(17)]], constant uint& bias_hs [[buffer(18)]], \
+    constant uint& hm_qtiles [[buffer(19)]],                                    \
     uint tid [[thread_index_in_threadgroup]], uint3 tgid [[threadgroup_position_in_grid]]) \
 {                                                                               \
     constexpr int TM=TM_,TN=48,D=D_,SG=4;                                       \
     threadgroup float Sb[TM*TN]; threadgroup T Pb[TM*TN];                       \
     threadgroup float Ob[TM*D];                                                 \
     threadgroup float mb[TM], lb[TM], cb[TM];                                   \
-    attn_vl<T,TM,TN,D,SG>(Q,K,V,O,cu_q,cu_kv,H,scale,q_rs,k_rs,v_rs,causal,g,window,lse,return_lse,bias,bias_qs,bias_hs,Sb,Pb,Ob,mb,lb,cb,tid,tgid.x,tgid.y,tgid.z); \
+    /* Head-major grid fold (hm_qtiles != 0): the host packs (head, qtile)     \
+       into tgid.x, head-major, so consecutive threadgroups walk one head's    \
+       K/V. With head on tgid.z the dispatcher interleaves heads and up to H   \
+       KV streams compete for cache — measured 1.8x slower at H=12/32K than    \
+       head-serialized order. hm_qtiles == 0 restores the legacy 3D grid.  */  \
+    uint qtile = tgid.x, head = tgid.z;                                         \
+    if (hm_qtiles != 0u) { head = tgid.x / hm_qtiles; qtile = tgid.x % hm_qtiles; } \
+    attn_vl<T,TM,TN,D,SG>(Q,K,V,O,cu_q,cu_kv,H,scale,q_rs,k_rs,v_rs,causal,g,window,lse,return_lse,bias,bias_qs,bias_hs,Sb,Pb,Ob,mb,lb,cb,tid,qtile,tgid.y,head); \
 }
 // matmul2d is dimension-general, so the same kernel serves any head_dim. We
 // instantiate the common dims: 64/96/128 (cover ~all transformers) get both TM

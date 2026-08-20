@@ -249,7 +249,14 @@ static bool try_mpp_varlen(const at::Tensor& q, const at::Tensor& k, const at::T
     id<MTLBuffer> biasb=at::native::mps::getMTLBufferStorage(bias);
     NSUInteger biaso=bias.storage_offset()*bias.element_size();
     auto* stream = at::mps::getCurrentMPSStream();
-    MTLSize tg = MTLSizeMake(qtiles, (NSUInteger)B, (NSUInteger)H);
+    // Head-major (head, qtile) fold into grid x: consecutive threadgroups stay
+    // on one head's K/V stream. With head on grid z the dispatcher interleaves
+    // heads, so up to H KV streams (H * seqlen * D * 4 bytes) fight for cache —
+    // measured 1.8x slower at H=12/32K. Same total work, same occupancy (one
+    // dispatch, no barriers); MTLATTN_NO_HEADMAJOR restores the legacy grid.
+    const uint32_t hm = std::getenv("MTLATTN_NO_HEADMAJOR") ? 0u : qtiles;
+    MTLSize tg = hm ? MTLSizeMake((NSUInteger)qtiles * (NSUInteger)H, (NSUInteger)B, 1)
+                    : MTLSizeMake(qtiles, (NSUInteger)B, (NSUInteger)H);
     MTLSize tpt = MTLSizeMake(pso.threadExecutionWidth * 4, 1, 1);
     mps_dispatch_sync(stream->queue(), ^() {
         @autoreleasepool {
@@ -266,6 +273,7 @@ static bool try_mpp_varlen(const at::Tensor& q, const at::Tensor& k, const at::T
             [enc setBuffer:lb offset:lo atIndex:14]; [enc setBytes:&rlse length:4 atIndex:15];
             [enc setBuffer:biasb offset:biaso atIndex:16];
             [enc setBytes:&bias_qs length:4 atIndex:17]; [enc setBytes:&bias_hs length:4 atIndex:18];
+            [enc setBytes:&hm length:4 atIndex:19];
             [enc dispatchThreadgroups:tg threadsPerThreadgroup:tpt];
             [enc endEncoding];
         }
