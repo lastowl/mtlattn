@@ -35,18 +35,18 @@ kernel fixes:
 1. **Wasted compute + memory** on padding, and an `O(B·H·Lmax²)` score
    tensor that blows up unified memory (a real 49K-token workload needed a
    54 GiB allocation).
-2. **A silent-correctness bug in PyTorch's MPS SDPA.** When the score
-   matrix `B·H·Nq·Nkv` exceeds ~2³² elements, MPS SDPA returns physically
-   impossible values with *no error* (the corruption hits later query rows
-   first, so naive spot-checks of the first rows miss it). This is a known
-   upstream bug — reported as
-   [pytorch/pytorch#179352](https://github.com/pytorch/pytorch/issues/179352)
-   and fixed by the in-progress PR
-   [#179592](https://github.com/pytorch/pytorch/pull/179592); it reproduces
-   on torch ≤ 2.12 until that lands. The root cause is a 32-bit index inside
-   Apple's MPSGraph (reachable via `sdpa_general_mps`). This kernel streams
-   in constant memory and matches a CPU fp32 reference at those sizes, so
-   it's correct today regardless. (Repro:
+2. **A silent-correctness bug in PyTorch's MPS SDPA on torch ≤ 2.12.** When
+   the score matrix `B·H·Nq·Nkv` exceeds ~2³² elements, MPS SDPA returns
+   physically impossible values with *no error* (the corruption hits later
+   query rows first, so naive spot-checks of the first rows miss it) — a
+   32-bit index inside Apple's MPSGraph, reachable via `sdpa_general_mps`.
+   Reported as
+   [pytorch/pytorch#179352](https://github.com/pytorch/pytorch/issues/179352),
+   fixed by [#179592](https://github.com/pytorch/pytorch/pull/179592);
+   **the fix shipped in torch 2.13** (verified: correct at 7.2e9 score
+   elements where 2.12 corrupts). On torch ≤ 2.12 this kernel streams in
+   constant memory and matches a CPU fp32 reference at those sizes, so it's
+   correct regardless of torch version. (Repro / regression check:
    [`tests/test_mps_sdpa_bug.py`](tests/test_mps_sdpa_bug.py).)
 
 ## Install
@@ -56,8 +56,10 @@ pip install mtlattn
 ```
 
 Requires macOS on Apple Silicon and PyTorch with MPS. The published wheels are
-built against **torch 2.12** for **Python 3.11–3.13** (a torch C++ extension is
-tied to the torch version it was built against). One arm64 wheel covers every
+built against **torch 2.13** for **Python 3.11–3.13** (a torch C++ extension is
+tied to the torch version it was built against — a mismatched wheel fails at
+call time with errors like `tensor does not have a device`; torch 2.12 wheels
+are attached to the GitHub release). One arm64 wheel covers every
 Apple Silicon Mac — the Metal 4 `matmul2d` accelerator path runs on any GPU with
 macOS 26.2+ (M3/M4/M5; confirmed on M4), the portable simdgroup path covers M1/M2
 and pre-26.2; selected at runtime. Both metallibs are bundled and the MPP
@@ -206,8 +208,16 @@ M5 Pro, fp16, 12 heads, head_dim 128, through the API:
 
 | Path | TFLOPS | notes |
 |---|---|---|
-| simdgroup (register-resident) | ~1.2 | portable M1+; ~0.4× native MPS SDPA on *dense* shapes |
-| **MPP (M5 accelerator)** | **~10** | **~8× the simdgroup path; ~3.4× native SDPA (~2.9)** |
+| simdgroup (register-resident) | ~1.2 | portable M1+; loses to native MPS SDPA on *dense* shapes |
+| **MPP (M5 accelerator)** | **~10** (≤8K); ~7.8 at 16–32K | **~8× the simdgroup path** |
+
+How that compares to native SDPA depends on the torch version — **torch 2.13
+made MPS SDPA much faster** (~7.0 TF/s at these shapes, vs ~2.9 on ≤ 2.12):
+
+| native SDPA (same shapes) | TF/s | MPP advantage |
+|---|---|---|
+| torch ≤ 2.12 | ~2.9 | **~3.4×** |
+| torch 2.13 | ~6.8–7.1 | ~1.45× at ≤8K, ~1.1× at 16–32K |
 
 The MPP path streams K/V in TM=16 query tiles with the online-softmax output
 accumulated in threadgroup memory via `matmul2d` multiply-accumulate, a
@@ -217,13 +227,15 @@ practical flash-attention ceiling. The backward runs on the same `matmul2d` path
 (~12 TFLOPS, faster than the forward — it's more matmul-dense).
 
 The simdgroup path is a portable fallback, not a dense-SDPA competitor: on equal-
-length dense attention native MPS SDPA is faster (~2.9 TFLOPS). mtlattn wins
-where SDPA can't go — ragged/windowed/varlen shapes (no padding, no `[L,L]`
-matrix), the M5 accelerator, training (backward), and the >2³² correctness bug.
+length dense attention native MPS SDPA is faster. mtlattn wins where SDPA
+can't go — ragged/windowed/varlen shapes (no padding, no `[L,L]` matrix), the
+M5 accelerator, training (backward), and on torch ≤ 2.12 the >2³²
+correctness bug.
 
 vs padded SDPA (the usual MPS fallback): mtlattn runs windowed/ragged
 attention ~20× faster, handles 49K-token sequences in constant memory where
-SDPA needs 54 GiB, and is correct where SDPA silently corrupts (see below).
+SDPA needs 54 GiB, and is correct where SDPA silently corrupts on
+torch ≤ 2.12 (see below).
 
 Reproduce on your machine with the benchmark CLI:
 

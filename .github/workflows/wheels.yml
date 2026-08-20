@@ -17,12 +17,16 @@ jobs:
       fail-fast: false
       matrix:
         # One wheel per (Python, torch ABI). A torch C++ extension is tied to the
-        # torch version it is built against. Pinned to torch that runs on the
+        # torch version it is built against (a mismatch fails at call time with
+        # e.g. "tensor does not have a device"). Pinned to torch that runs on the
         # macos-26 build/test image — torch <= 2.7 (early 2025) predates macOS 26
         # and its own MPS backend fails to JIT-compile there. Widen as newer torch
         # releases land (each addition needs a green run on this image).
+        # NOTE: wheel filenames don't encode the torch version, so only ONE torch
+        # leg can go to PyPI — the publish job picks PYPI_TORCH; the rest stay
+        # downloadable build artifacts (attach them to the GitHub release).
         python: ["3.11", "3.12", "3.13"]
-        torch: ["2.12"]            # ".*" appended in the pip spec (artifact names forbid "*")
+        torch: ["2.12", "2.13"]    # ".*" appended in the pip spec (artifact names forbid "*")
     env:
       # Broad install range; the metal4.0 MPP path is gated at runtime so a
       # low deployment target is fine (the extension weak-links MPP).
@@ -80,18 +84,24 @@ jobs:
 
   # Publish to PyPI via Trusted Publishing (OIDC) on a v* tag. No token: PyPI
   # is configured with this repo + workflow (wheels.yml) + environment "pypi".
+  # Only the PYPI_TORCH wheels are uploaded — wheel filenames don't encode the
+  # torch ABI, so the matrix legs would collide on PyPI. Keep this at the torch
+  # most users install fresh; older-torch wheels ship via the GitHub release.
   publish:
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment: pypi
+    env:
+      PYPI_TORCH: "2.13"
     permissions:
       id-token: write          # mint the short-lived OIDC token
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: dist
-          merge-multiple: true   # collect every matrix wheel into dist/
+          pattern: mtlattn-py*-torch${{ env.PYPI_TORCH }}
+          merge-multiple: true   # collect the PYPI_TORCH wheels into dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
