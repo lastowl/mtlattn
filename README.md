@@ -194,9 +194,9 @@ Two kernel paths, selected automatically at runtime:
   `matmul2d`. The path is OS-gated, not GPU-family-gated — on M5 `matmul2d`
   targets the per-core **Neural Accelerator** (~9 TFLOPS); on M3/M4 it runs on the
   regular GPU matrix units (**confirmed on an M4: ~1.9 TFLOPS, ~3–4× the
-  simdgroup kernel and ~2–3× native SDPA**). The size-adaptive query tile (TM
-  16↔32) is gated to Apple10+ GPUs — M3/M4 always use TM=16, which is fastest
-  there at every length.
+  simdgroup kernel and ~2–3× native SDPA**). The query tile is TM=16 at every
+  length (re-measured: the TM=32 long-sequence variant never wins on the
+  current stack; `MTLATTN_TM32_MIN` opts back in).
 - **simdgroup path** (portable, M1+): the fallback used on older GPUs, older
   macOS, head dims other than 64/128, or when `MTLATTN_NO_MPP=1`. For head_dim
   128 it's a register-resident kernel — scores/probs/output live in

@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- **Long-sequence forward retune: TM=16 at every length** (+19% at 16K, +12%
+  at 32K on M5 Pro; e.g. 16K H=12 fp16 7.6→9.4 TF/s, 32K bf16 → 8.95 TF/s).
+  The old ≥14K crossover to TM=32 no longer wins on current macOS — verified
+  by interleaved A/B on both the 26.2- and 26.6-toolchain metallibs, and its
+  bandwidth-floor rationale is contradicted by measurement (TM=16 sustains
+  ~2× its no-reuse floor; the cache absorbs the K/V re-reads, so TM=32 only
+  costs occupancy). TM=32 kernels stay built; `MTLATTN_TM32_MIN` opts back in.
+  Also measured and rejected: routing long-query shapes through the splitKV
+  chunked path (strictly slower; see `docs/PERFORMANCE.md`).
+- **torch 2.13**: the `>2^32` MPS SDPA silent-corruption bug is fixed upstream
+  in 2.13 (README claims updated; `tests/test_mps_sdpa_bug.py` now reports
+  per-build status), and native MPS SDPA is ~2.3× faster than on ≤2.12, so
+  comparison tables are re-stated per torch version. Wheel matrix gains a
+  torch-2.13 leg (published to PyPI; 2.12 wheels move to the GitHub release).
+- **New upstream-bug repro**: `tests/test_mps_fused_to_bug.py` — fused
+  `.to("cpu", dtype)` from an offset MPS view is silently wrong on every
+  stable torch through 2.13 (fixed in nightly); benchmarks/tests here use
+  two-step host transfers.
+
 ## 0.4.0 (2026-06-18)
 
 Headline: **decode acceleration** — splitKV / FlashDecoding (8–20× faster decode)

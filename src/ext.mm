@@ -12,6 +12,7 @@
 #include <torch/extension.h>
 #include <dlfcn.h>
 #include <exception>
+#include <limits>
 #include <string>
 #include <unordered_map>
 
@@ -210,12 +211,17 @@ static bool try_mpp_varlen(const at::Tensor& q, const at::Tensor& k, const at::T
     if (q.stride(1) != D || k.stride(1) != D || v.stride(1) != D) return false;
     if (q.stride(2) != 1 || k.stride(2) != 1 || v.stride(2) != 1) return false;
     auto& ctx = Context::instance();
-    // TM=16 maximizes occupancy mid-range; on M5 (NA) TM=32 halves K/V re-reads
-    // and wins once the NA-fast matmul goes bandwidth-bound at very long sequences
-    // (crossover ~14K with the TN=48 tile; below it TM=16 is faster). On M3/M4
-    // (no NA) the matmul stays compute-bound and TM=16 wins at every size, so
-    // TM=32 is gated to NA-capable GPUs. Override the crossover via MTLATTN_TM32_MIN.
-    int64_t tm32_min = 14336;
+    // TM=16 wins at EVERY length on current stacks: re-measured on M5 Pro
+    // (macOS 26.5, Metal toolchains 26.2 and 26.6) with interleaved A/B —
+    // TM16 9.2-9.8 TF vs TM32 7.5-7.6 at 16K, 8.4 vs 7.5 at 32K, and 10.1-10.3
+    // vs 7.8-7.9 flat out to 64K single-head. The bandwidth-floor rationale for
+    // TM=32 ("halves K/V re-reads once bandwidth-bound") doesn't hold: TM=16's
+    // no-reuse floor would be ~4.3 TF, so the cache is already absorbing the
+    // re-reads, and TM=32 just costs occupancy (25 KB vs 12.6 KB threadgroup).
+    // TM=32 kernels stay built; opt back in via MTLATTN_TM32_MIN if a chip
+    // measures differently. (Historical default was 14336 on the same M5 Pro —
+    // the win did not reproduce; suspected earlier-macOS/driver difference.)
+    int64_t tm32_min = std::numeric_limits<int64_t>::max();
     if (const char* e = std::getenv("MTLATTN_TM32_MIN")) tm32_min = atoll(e);
     // head_dim 256 only has a TM=16 kernel (its [32,256] O accumulator can't fit
     // threadgroup memory at TM=32).

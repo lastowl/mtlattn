@@ -316,10 +316,10 @@ inline void attn_vl(device const T* Q, device const T* K, device const T* V, dev
     }
 }
 
-// TM is dispatched by sequence length: TM=16 maximizes occupancy at mid-range
-// (the win below ~10K tokens), TM=32 halves the K/V re-reads and wins at long
-// sequences where the GPU is already saturated (>=~10K, e.g. 3D-sparse
-// transformers). The host picks the kernel by max_seqlen_q.
+// TM=16 is the default at every length (re-measured on M5 Pro / macOS 26.5:
+// TM=32's K/V re-read saving never beats its occupancy cost — the cache
+// absorbs the re-reads; see ext.mm's tm32_min comment). The TM=32 kernels
+// stay built for MTLATTN_TM32_MIN opt-in on chips that measure differently.
 #define INSTANTIATE_MPP_VL(NAME, T, TM_, D_)                                    \
 kernel void NAME(                                                               \
     device const T* Q [[buffer(0)]], device const T* K [[buffer(1)]], device const T* V [[buffer(2)]], \
