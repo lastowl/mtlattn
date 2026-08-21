@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **Head-major grid fold — multi-head long-sequence interference fixed**
+  (+22% at H=12/32K on top of the TM=16 retune; the forward now sustains
+  **~10.2–10.6 TF/s flat from 2K to 64K tokens** on M5 Pro, ~1.5× torch-2.13
+  native SDPA). The dispatcher interleaves grid z, so with head on z up to H
+  KV streams fought for cache; (head, qtile) now folds head-major into grid
+  x so consecutive threadgroups walk one head's K/V. Bit-identical outputs;
+  `MTLATTN_NO_HEADMAJOR` restores the legacy grid. Also measured and
+  recorded as dead-ends: wider key tiles (TN 96/144 — flat) and TM=32 under
+  the new grid (still occupancy-bound); see `docs/PERFORMANCE.md`.
 - **Long-sequence forward retune: TM=16 at every length** (+19% at 16K, +12%
   at 32K on M5 Pro; e.g. 16K H=12 fp16 7.6→9.4 TF/s, 32K bf16 → 8.95 TF/s).
   The old ≥14K crossover to TM=32 no longer wins on current macOS — verified

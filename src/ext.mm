@@ -74,9 +74,8 @@ struct Context {
         device = MTLCreateSystemDefaultDevice();
         TORCH_CHECK(device != nil, "mtlattn: no Metal device");
         // GPU family Apple10 (numeric 1010) = M5 and newer (the Neural
-        // Accelerator). Used to pick the MPP tile: M5's NA-fast matmul becomes
-        // bandwidth-bound at long sequences (TM=32 wins there), but on M3/M4 the
-        // regular matrix units stay compute-bound, so TM=16 wins at every size.
+        // Accelerator). Gates the TM=32 kernels' MTLATTN_TM32_MIN opt-in;
+        // the default is TM=16 at every length (see tm32_min below).
         na_capable = [device supportsFamily:(MTLGPUFamily)1010];
 
         // GPU core count (IORegistry AGXAccelerator 'gpu-core-count') — lets the

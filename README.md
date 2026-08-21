@@ -209,15 +209,15 @@ M5 Pro, fp16, 12 heads, head_dim 128, through the API:
 | Path | TFLOPS | notes |
 |---|---|---|
 | simdgroup (register-resident) | ~1.2 | portable M1+; loses to native MPS SDPA on *dense* shapes |
-| **MPP (M5 accelerator)** | **~10** (≤8K); ~7.8 at 16–32K | **~8× the simdgroup path** |
+| **MPP (M5 accelerator)** | **~10.2–10.6**, flat 2K–64K | **~8× the simdgroup path** |
 
 How that compares to native SDPA depends on the torch version — **torch 2.13
 made MPS SDPA much faster** (~7.0 TF/s at these shapes, vs ~2.9 on ≤ 2.12):
 
 | native SDPA (same shapes) | TF/s | MPP advantage |
 |---|---|---|
-| torch ≤ 2.12 | ~2.9 | **~3.4×** |
-| torch 2.13 | ~6.8–7.1 | ~1.45× at ≤8K, ~1.1× at 16–32K |
+| torch ≤ 2.12 | ~2.9 | **~3.6×** |
+| torch 2.13 | ~6.8–7.1 | **~1.5×** |
 
 The MPP path streams K/V in TM=16 query tiles with the online-softmax output
 accumulated in threadgroup memory via `matmul2d` multiply-accumulate, a
