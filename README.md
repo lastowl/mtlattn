@@ -153,6 +153,12 @@ Runnable tour of all of the above: [`examples/quickstart.py`](examples/quickstar
 
 ## Using it in your project
 
+**ComfyUI.** Install [ComfyUI-mtlattn](https://github.com/lastowl/ComfyUI-mtlattn)
+into `custom_nodes/` and add its **Apply mtlattn Attention** node between the
+model loader and the sampler — video / 3D / image DiTs route their attention
+through mtlattn, everything else falls back to ComfyUI's default. Measured on an
+M5 Pro: a Wan 2.1 480p·81-frame sampling run 2.35× faster end to end.
+
 **Existing PyTorch / Hugging Face model — no code changes.** Route attention
 through mtlattn for the large forward passes it wins on; everything else falls
 back to native SDPA:
