@@ -7,7 +7,9 @@ to lose or to be API-blocked).
 
 All numbers measured on an **M5 Pro** (Apple10 GPU family, has the per-core Neural
 Accelerator) and an **M4 Mac mini** (Mac16,10, Apple9, no NA), fp16, H=12,
-head_dim=128, macOS 26.x, torch 2.12, unless noted. **Read the measurement
+head_dim=128, macOS 26.x, torch 2.12, unless noted. (Native-SDPA *reference*
+numbers are torch-version-sensitive — 2.13 made MPS SDPA ~2.3× faster; see
+the note under the standing table.) **Read the measurement
 caveats at the bottom before trusting any single number** — M-series GPU clocks
 are load-state-dependent and burst benchmarks lie.
 
@@ -42,15 +44,23 @@ small tiles, making it bandwidth- or occupancy-bound in practice.
 
 | | M5 fwd | M5 bwd | M4 fwd | M4 bwd |
 |---|---|---|---|---|
-| mid-range (N≤8K) | ~9.5 TF | ~5.8 TF | ~1.9 TF | ~2.8 TF |
-| large-N (12–18K) | ~7.5–9.5* | ~5.6 TF | ~1.9 TF | — |
+| mid-range (N≤8K) | ~10.2–10.6 TF | ~5.8 TF | ~1.9 TF | ~2.8 TF |
+| large-N (16–64K, H=12) | ~10.5–10.6 TF (head-major + TM16) | ~5.6 TF | ~1.9 TF | — |
 
 \* large-N forward is clock-ramp-sensitive; see caveats. Reference: native MPS
-SDPA ≈ 2.9 TF (M5). So MPP forward ≈ **3× SDPA**, backward ≈ **11× the
-simdgroup-per-row backward** (apples-to-apples, same session).
+SDPA ≈ 2.9 TF (M5) **on torch ≤ 2.12**; **torch 2.13 rewrote MPS SDPA** and it
+now sustains ~6.8–7.1 TF on M5 Pro at these shapes (2K–32K dense, fp16/bf16).
+So MPP forward ≈ 3× SDPA on torch ≤ 2.12, but only ~1.45× (≤8K) to ~1.1×
+(16–32K) on 2.13; backward ≈ **11× the simdgroup-per-row backward**
+(apples-to-apples, same session). Also measured on 2.13 (M5 Pro): chunked
+MPSGraph bmm attention (ComfyUI's sub_quad) reaches **~10–11.9 TF in bf16**
+at 16–32K dense (bf16 bmm hits an NA fast path; its fp16 variant only ~3.5–4
+TF). Post head-major fold we match it at 32K (10.5 vs ~10.1–10.6) and trail
+only in a ~16K bf16 window (10.6 vs 11.9).
 
-- **Forward** ≈ 9.5 TF = ~73% of the practical ceiling, ~32% of the NA fp16 peak.
-  Near its structural limit; the residual ~16% is softmax (see below).
+- **Forward** ≈ 10.5 TF = ~81% of the practical ceiling, ~35% of the NA fp16
+  peak. Near its structural limit; the residual is softmax/accumulate
+  structure (wider TN tiles don't recover it — see the sweep note below).
 - **Backward** ≈ 5.8 TF — the **slower half**, occupancy-bound. It recomputes
   S=Q·Kᵀ and re-reads Q/dO per KV-block, but bigger tiles (to cut re-reads)
   *lose* to occupancy, so it's tuned to BK=16/BQ=32.
@@ -81,9 +91,38 @@ simdgroup-per-row backward** (apples-to-apples, same session).
 Forward (`attn_vl`, MPP):
 - **TM=16, TN=48, SG=4.** TN was 32 until the softmax got cheaper (exp2 / raw-max
   scan + in-place PV accumulate); the optimum then shifted to **TN=48** (+13–33%).
-- **Size-adaptive TM**: TM=16 below ~14K tokens, TM=32 at/above — **only on
-  Apple10+ (M5+)**, gated via `supportsFamily`. M3/M4 always TM=16 (TM=32 never
-  wins there). Override: `MTLATTN_TM32_MIN`.
+- **TM=16 at every length** (retuned 2026-08). The old size-adaptive rule
+  (TM=32 at ≥~14K on Apple10+) stopped holding: interleaved A/B on the same
+  M5 Pro now measures TM16 > TM32 at every size — 9.2 vs 7.6 TF at 16K,
+  8.4 vs 7.5 at 32K, 10.1–10.3 vs 7.8–7.9 flat to 64K at H=1 — on both the
+  26.2- and 26.6-toolchain metallibs (so not a compiler change; suspected
+  macOS/driver change since the original tuning). The bandwidth-floor model
+  behind TM=32 is contradicted by TM=16 sustaining ~2× its no-reuse floor —
+  the cache absorbs K/V re-reads, and TM=32's 25 KB threadgroup (vs 12.6 KB)
+  just costs occupancy. TM=32 kernels stay built; `MTLATTN_TM32_MIN` opts in.
+- **Long-sequence falloff was multi-head interference — fixed by the
+  head-major grid fold** (2026-08). At 32K, H=1 sustained 10.1 TF but H=12
+  only 8.4; 12 sequential H=1 dispatches beat one H=12 dispatch 1.8×, packed
+  vs strided views differed only ~3% → scheduling, not layout: the dispatcher
+  interleaves grid z, so up to H KV streams (~200 MB at 12×32K) fought for
+  cache. Folding (head, qtile) head-major into grid x keeps consecutive
+  threadgroups on one head's stream: H=12 now sustains **~10.5–10.6 TF at
+  2K–64K, flat** — the H=1 per-stream ceiling. Same work, same occupancy,
+  bit-identical outputs; `MTLATTN_NO_HEADMAJOR` restores the legacy grid.
+- **TN sweep at TM=16: flat.** TN 48/96/144 all measure identically
+  (10.5–10.6 TF at 4K–32K) — per-tile overheads (Ob rescale pass, barriers,
+  matmul launches) are not the binding constraint, so the "~16% softmax
+  residual" isn't recoverable by wider key tiles. Experimental kernels
+  removed; re-create via a TN_ parameter on `INSTANTIATE_MPP_VL` if needed.
+- **TM=32 re-tested under head-major: still loses** (8.2–8.4 vs 10.5–10.6 at
+  8K–32K) — its deficit is genuinely occupancy (25 KB threadgroup vs
+  12.6 KB), not the head interference it was originally blamed on.
+- **KV-chunked two-pass (splitKV at long queries): measured, loses.** Routing
+  32K-query shapes through the existing split kernels (so a wave of query
+  tiles walks one SLC-sized KV chunk) is 4.8–6.4 TF vs 7.2 single-pass at
+  every split count tried (2–16) — the hoped-for chunk residency doesn't
+  materialize as a win, and the TM=16 split kernel pays the partial-spill +
+  combine overhead on top. Correct (err ≤ 5e-4) but strictly slower.
 - **LPR=2** (softmax threads/row) — LPR≥4 helps N=2048 slightly but regresses
   ~20% at N=8192 (threadgroup contention).
 - **exp2** with `log2(e)` folded into the scale; **raw max-scan** (`max(S·scl) =
@@ -138,6 +177,17 @@ Simdgroup fallback (`attn_mpp.metal` → no; `attention.metal`):
   tensors cost ~128 regs/thread and collapse occupancy. (Scores `[TM,TN]` are
   small enough to be register-resident; the *output* accumulator is not.)
 - **TM=64 register-resident output**: same occupancy collapse.
+- **Async-copy double-buffered K/V staging** (MFA/FlashAttention-3-style software
+  pipelining): **infeasible at the efficient tile sizes, not just risky.** matmul2d
+  *does* accept threadgroup operands (compile-verified), so staging K/V into
+  threadgroup is possible in principle — but double-buffering K/V (2× K + 2× V at
+  TN=48/D=128 = **48 KB**) plus the O accumulator + scores (~12 KB) needs **~60 KB**
+  vs the **32 KB** threadgroup limit. Even single-buffer staging (36.5 KB) is over.
+  It only fits at TN=16 (tiny, inefficient matmuls). This is *why* the production
+  kernel reads K/V from `device` via matmul2d — it offloads K/V streaming without
+  spending threadgroup memory, which is the right call under the 32 KB cap. And the
+  win would be pure latency-hiding, which doesn't help an occupancy/bandwidth-bound
+  kernel anyway.
 - **Bigger backward grid tiles** (BK=24, BQ=48) to cut Q/dO re-reads: *slower*
   (4.0 vs 5.8 TF) — occupancy loss beats bandwidth saving. The backward is
   occupancy-bound.
