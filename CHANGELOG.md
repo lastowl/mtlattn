@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.4.1 (2026-08-21)
+
+Headline: **forward ~10.2–10.6 TF/s flat from 2K to 64K tokens on M5 Pro** —
+head-major grid fold + TM=16 retune (+37% at H=12/32K combined), torch-2.13
+wheels and re-stated comparisons, and a new upstream MPS bug repro.
 
 - **Head-major grid fold — multi-head long-sequence interference fixed**
   (+22% at H=12/32K on top of the TM=16 retune; the forward now sustains
